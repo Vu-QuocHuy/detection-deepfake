@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Deep%20Learning-EfficientNet-6366F1?style=for-the-badge&logo=tensorflow&logoColor=white" alt="EfficientNet"/>
   <img src="https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch"/>
-  <img src="https://img.shields.io/badge/Jupyter-F37626?style=for-the-badge&logo=jupyter&logoColor=white" alt="Jupyter"/>
+  <img src="https://img.shields.io/badge/Code-Production--Ready-00D084?style=for-the-badge&logo=checkmarx&logoColor=white" alt="Production"/>
 </p>
 
 <p align="center">
@@ -82,7 +82,7 @@ Easy integration with pre-trained models and comprehensive notebooks
 | 📊 **High Accuracy** | Achieves up to **87.04% accuracy** with low EER of **12.96%** |
 | 📹 **Video Processing** | Efficient frame extraction and batch processing pipeline |
 | 🎯 **Transfer Learning** | Pre-trained models ready for fine-tuning on custom datasets |
-| 📓 **Interactive Notebooks** | Complete Jupyter notebooks for training, testing, and inference |
+| 💻 **Production Scripts** | Professional Python scripts for training, testing, and inference |
 | ⚙️ **Configurable Pipeline** | Modular design for easy customization and experimentation |
 | 🔬 **Research-Grade** | Implements cutting-edge techniques from 2024-2025 research |
 
@@ -175,67 +175,109 @@ efficientnet-pytorch>=0.7.1
 
 ## 🚀 Usage
 
-### 1️⃣ Video to Image Extraction with MTCNN
+### 1️⃣ Face Extraction from Videos/Images
 
-Extract faces from video files using MTCNN face detection:
+Extract faces using MTCNN for dataset preparation:
 
-```python
-# Open: save_video2image_fast_mtcnn.ipynb
-# This notebook includes:
-# - Fast video frame extraction
-# - MTCNN-based face detection
-# - Automated dataset preparation
+```bash
+# Extract faces from videos
+python scripts/extract_faces.py \
+    --input-dir /path/to/videos \
+    --output-dir /path/to/extracted_faces \
+    --mode video \
+    --batch-size 60 \
+    --frame-skip 30
+
+# Extract faces from images
+python scripts/extract_faces.py \
+    --input-dir /path/to/images \
+    --output-dir /path/to/extracted_faces \
+    --mode image
 ```
 
 ### 2️⃣ Training the Model
 
 Train EfficientNet on your dataset:
 
-```python
-# Open: DeepFake Training & Testing.ipynb
-# Features:
-# - Data augmentation pipeline
-# - Transfer learning setup
-# - Training with validation
-# - Model checkpointing
+```bash
+python scripts/train.py \
+    --train-real /path/to/train/real \
+    --train-fake /path/to/train/fake \
+    --val-real /path/to/val/real \
+    --val-fake /path/to/val/fake \
+    --output-dir outputs \
+    --batch-size 32 \
+    --epochs 20 \
+    --lr 8e-4 \
+    --model efficientnet-b1
 ```
 
-### 3️⃣ Enhanced Training (More Data)
+**Features:**
+- ✅ Automatic checkpointing every epoch
+- ✅ Training history visualization
+- ✅ Best model selection based on validation accuracy
+- ✅ Comprehensive logging
+- ✅ Resume training from checkpoint
 
-For better performance with larger datasets:
+### 3️⃣ Testing & Evaluation
 
-```python
-# Open: DeepFake Training & Testing (More Data).ipynb
-# Includes:
-# - Extended dataset handling
-# - Advanced augmentation techniques
-# - Hyperparameter optimization
-# - Comprehensive evaluation metrics
+Evaluate model on test set with comprehensive metrics:
+
+```bash
+python scripts/test.py \
+    --test-real /path/to/test/real \
+    --test-fake /path/to/test/fake \
+    --checkpoint outputs/checkpoints/best_model.pth \
+    --output-dir test_results \
+    --batch-size 100 \
+    --save-predictions
 ```
 
-### 🎯 Quick Inference Example
+**Outputs:**
+- 📊 Comprehensive metrics (EER, ACER, APCER, NPCER, accuracy, AUC-ROC)
+- 📈 Confusion matrix visualization
+- 📉 ROC curve (FAR vs FRR)
+- 💾 Predictions CSV file
+
+### 4️⃣ Inference on New Data
+
+Run inference on single images or directories:
+
+```bash
+# Single image inference
+python scripts/inference.py \
+    --input /path/to/image.jpg \
+    --checkpoint outputs/checkpoints/best_model.pth \
+    --model efficientnet-b1
+
+# Batch inference on directory
+python scripts/inference.py \
+    --input /path/to/images/directory \
+    --checkpoint outputs/checkpoints/best_model.pth \
+    --model efficientnet-b1 \
+    --output predictions.csv
+```
+
+### 🎯 Quick Python API Example
 
 ```python
 import torch
-from efficientnet_pytorch import EfficientNet
-from PIL import Image
-import torchvision.transforms as transforms
+from deepfake_detector.models import DeepFakeDetector
+from deepfake_detector.data import get_val_transforms
+import cv2
 
-# Load pre-trained model
-model = EfficientNet.from_pretrained('efficientnet-b0', num_classes=2)
-model.load_state_dict(torch.load('model-2.pth'))
+# Load model
+model = DeepFakeDetector(model_name='efficientnet-b1')
+model.load_checkpoint('outputs/checkpoints/best_model.pth')
 model.eval()
 
 # Prepare image
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+transform = get_val_transforms(image_size=240)
+image = cv2.imread('face.jpg')
+image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+image_tensor = transform(image=image_rgb)['image'].unsqueeze(0)
 
 # Predict
-image = Image.open('face.jpg')
-image_tensor = transform(image).unsqueeze(0)
 with torch.no_grad():
     output = model(image_tensor)
     prediction = torch.softmax(output, dim=1)
@@ -252,24 +294,53 @@ print(f"📊 Confidence: {max(prediction[0]).item():.2%}")
 ```
 DeepFake-EfficientNet/
 │
-├── 📓 DeepFake Training & Testing.ipynb
-│   └── Core training and evaluation notebook
+├── deepfake_detector/          # Main package
+│   ├── __init__.py
+│   ├── models/                 # Model definitions
+│   │   ├── __init__.py
+│   │   └── efficientnet.py    # EfficientNet-based detector
+│   ├── data/                   # Data loading and preprocessing
+│   │   ├── __init__.py
+│   │   ├── dataset.py         # Dataset classes
+│   │   ├── loader.py          # DataLoader utilities
+│   │   └── transforms.py      # Augmentation pipelines
+│   ├── utils/                  # Utility functions
+│   │   ├── __init__.py
+│   │   ├── metrics.py         # Evaluation metrics (EER, ACER, etc.)
+│   │   ├── logger.py          # Logging utilities
+│   │   └── visualization.py   # Plotting functions
+│   └── config/                 # Configuration management
+│       ├── __init__.py
+│       └── config.py          # Config dataclass
 │
-├── 📓 DeepFake Training & Testing (More Data).ipynb
-│   └── Enhanced training with expanded dataset
+├── scripts/                    # Executable scripts
+│   ├── extract_faces.py       # MTCNN face extraction
+│   ├── train.py               # Training script
+│   ├── test.py                # Testing/evaluation script
+│   └── inference.py           # Inference script
 │
-├── 📓 save_video2image_fast_mtcnn.ipynb
-│   └── Video preprocessing and face extraction
+├── checkpoints/                # Model checkpoints (created during training)
+├── logs/                       # Training logs (created during training)
+├── results/                    # Results and visualizations
 │
-├── 📄 README.md
-│   └── Project documentation (you are here!)
-│
-├── 📄 LICENSE
-│   └── MIT License
-│
-└── 📄 .gitignore
-    └── Git ignore rules
+├── requirements.txt            # Python dependencies
+├── README.md                   # This file
+├── LICENSE                     # MIT License
+└── .gitignore                  # Git ignore rules
 ```
+
+### 📦 Package Organization
+
+The codebase follows **industry best practices**:
+
+- ✅ **Modular Design**: Separation of concerns with dedicated modules
+- ✅ **Type Hints**: Full type annotation for better IDE support
+- ✅ **Docstrings**: Comprehensive documentation for all functions/classes
+- ✅ **Logging**: Structured logging throughout the pipeline
+- ✅ **Error Handling**: Robust error handling and validation
+- ✅ **Configuration**: YAML/JSON config file support
+- ✅ **Testing Ready**: Easy to add unit tests
+- ✅ **Production Ready**: Clean, maintainable, scalable code
 
 ---
 
