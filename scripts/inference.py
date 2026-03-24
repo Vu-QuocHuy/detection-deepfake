@@ -18,7 +18,7 @@ from scipy.special import softmax
 import glob
 from tqdm import tqdm
 
-from deepfake_detector.models import DeepFakeDetector
+from deepfake_detector.models import DeepFakeDetector, TriStreamDeepFakeDetector
 from deepfake_detector.data import get_val_transforms
 from deepfake_detector.utils import setup_logger
 
@@ -63,6 +63,14 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--model', type=str, default='efficientnet-b1',
                         help='Model architecture')
+    parser.add_argument('--multistream', action='store_true',
+                        help='Use tri-stream RGB+frequency+SRM-like detector')
+    parser.add_argument('--freq-model', type=str, default='efficientnet-b2',
+                        help='EfficientNet variant for frequency stream')
+    parser.add_argument('--srm-model', type=str, default='efficientnet-b0',
+                        help='EfficientNet variant for SRM-like stream')
+    parser.add_argument('--srm-filters', type=int, default=30,
+                        help='Number of learnable SRM filters (noise channels)')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Classification threshold')
     parser.add_argument('--output', type=str, default=None,
@@ -83,13 +91,44 @@ def main():
 
     # Load model
     logger.info(f"Loading model from: {args.checkpoint}")
-    model = DeepFakeDetector(model_name=args.model, pretrained=False)
+
+    def _effnet_input_size(model_name: str) -> int:
+        name = model_name.lower()
+        if "b0" in name:
+            return 224
+        if "b1" in name:
+            return 240
+        if "b2" in name:
+            return 260
+        if "b3" in name:
+            return 300
+        if "b4" in name:
+            return 380
+        if "b5" in name:
+            return 456
+        if "b6" in name:
+            return 528
+        if "b7" in name:
+            return 600
+        return 224
+
+    if args.multistream:
+        model = TriStreamDeepFakeDetector(
+            rgb_model=args.model,
+            freq_model=args.freq_model,
+            srm_model=args.srm_model,
+            srm_filters=args.srm_filters,
+            pretrained=False,
+        )
+    else:
+        model = DeepFakeDetector(model_name=args.model, pretrained=False)
+
     model.load_checkpoint(args.checkpoint, device=str(device))
     model = model.to(device)
     model.eval()
 
     # Prepare transform
-    image_size = 240 if 'b1' in args.model else 224
+    image_size = _effnet_input_size(args.model)
     transform = get_val_transforms(image_size)
 
     # Check if input is file or directory

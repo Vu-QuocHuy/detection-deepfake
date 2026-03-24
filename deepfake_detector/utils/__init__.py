@@ -4,7 +4,9 @@ from deepfake_detector.utils.metrics import (
     calculate_metrics,
     get_EER_states,
     get_HTER_at_thr,
-    eval_state
+    eval_state,
+    calculate_comprehensive_metrics,
+    print_metrics,
 )
 from deepfake_detector.utils.logger import setup_logger, get_logger
 from deepfake_detector.utils.visualization import (
@@ -18,6 +20,8 @@ __all__ = [
     "get_EER_states",
     "get_HTER_at_thr",
     "eval_state",
+    "calculate_comprehensive_metrics",
+    "print_metrics",
     "setup_logger",
     "get_logger",
     "plot_confusion_matrix",

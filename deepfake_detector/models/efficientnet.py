@@ -111,15 +111,18 @@ class DeepFakeDetector(nn.Module):
         if 'model_state_dict' in checkpoint:
             self.load_state_dict(checkpoint['model_state_dict'])
             logger.info(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+            return checkpoint
         else:
             self.load_state_dict(checkpoint)
             logger.info("Loaded model weights")
+            return {}
 
     def save_checkpoint(
         self,
         checkpoint_path: str,
         epoch: Optional[int] = None,
         optimizer_state: Optional[dict] = None,
+        scheduler_state: Optional[dict] = None,
         metrics: Optional[dict] = None
     ) -> None:
         """
@@ -141,6 +144,8 @@ class DeepFakeDetector(nn.Module):
             checkpoint['epoch'] = epoch
         if optimizer_state is not None:
             checkpoint['optimizer_state_dict'] = optimizer_state
+        if scheduler_state is not None:
+            checkpoint['scheduler_state_dict'] = scheduler_state
         if metrics is not None:
             checkpoint['metrics'] = metrics
 

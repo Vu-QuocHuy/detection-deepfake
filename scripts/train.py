@@ -20,12 +20,33 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix
 
 # Import from our package
-from deepfake_detector.models import DeepFakeDetector
+from deepfake_detector.models import DeepFakeDetector, TriStreamDeepFakeDetector
 from deepfake_detector.data import create_combined_dataset, get_train_transforms, get_val_transforms, create_dataloaders
 from deepfake_detector.utils import setup_logger, calculate_comprehensive_metrics, plot_confusion_matrix, plot_training_history
 from deepfake_detector.config import Config, load_config
 
 from transformers import AdamW, get_cosine_schedule_with_warmup
+
+
+def _effnet_input_size(model_name: str) -> int:
+    name = model_name.lower()
+    if "b0" in name:
+        return 224
+    if "b1" in name:
+        return 240
+    if "b2" in name:
+        return 260
+    if "b3" in name:
+        return 300
+    if "b4" in name:
+        return 380
+    if "b5" in name:
+        return 456
+    if "b6" in name:
+        return 528
+    if "b7" in name:
+        return 600
+    return 224
 
 
 def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, logger):
@@ -115,14 +136,26 @@ def main():
                         help='Paths to validation fake images directories')
     parser.add_argument('--output-dir', type=str, default='outputs',
                         help='Output directory for checkpoints and logs')
-    parser.add_argument('--batch-size', type=int, default=32,
+    parser.add_argument('--batch-size', type=int, default=8,
                         help='Batch size')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of DataLoader workers')
     parser.add_argument('--epochs', type=int, default=20,
                         help='Number of epochs')
     parser.add_argument('--lr', type=float, default=8e-4,
                         help='Learning rate')
     parser.add_argument('--model', type=str, default='efficientnet-b1',
                         help='Model architecture')
+    parser.add_argument('--multistream', action='store_true',
+                        help='Use tri-stream RGB+frequency+SRM-like detector')
+    parser.add_argument('--freq-model', type=str, default='efficientnet-b2',
+                        help='EfficientNet variant for frequency stream')
+    parser.add_argument('--srm-model', type=str, default='efficientnet-b0',
+                        help='EfficientNet variant for SRM-like stream')
+    parser.add_argument('--srm-filters', type=int, default=30,
+                        help='Number of learnable SRM filters (noise channels)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable mixed precision (recommended on GPU)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint')
 
@@ -154,7 +187,7 @@ def main():
     # Create datasets
     logger.info("Creating datasets...")
 
-    image_size = 240 if 'b1' in args.model else 224
+    image_size = _effnet_input_size(args.model)
 
     train_transforms = get_train_transforms(image_size)
     val_transforms = get_val_transforms(image_size)
@@ -172,16 +205,29 @@ def main():
     logger.info(f"Val dataset: {len(val_dataset)} samples")
 
     # Create dataloaders
+    if args.multistream:
+        # Tri-stream is GPU-memory heavy; keep the default batch small.
+        args.batch_size = min(args.batch_size, 2)
+
     train_loader, val_loader, _ = create_dataloaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         batch_size=args.batch_size,
-        num_workers=4
+        num_workers=args.num_workers
     )
 
     # Create model
-    logger.info(f"Creating model: {args.model}")
-    model = DeepFakeDetector(model_name=args.model, pretrained=True)
+    logger.info(f"Creating model: {args.model} (multistream={args.multistream})")
+    if args.multistream:
+        model = TriStreamDeepFakeDetector(
+            rgb_model=args.model,
+            freq_model=args.freq_model,
+            srm_model=args.srm_model,
+            srm_filters=args.srm_filters,
+            pretrained=True,
+        )
+    else:
+        model = DeepFakeDetector(model_name=args.model, pretrained=True)
     model = model.to(device)
 
     total_params, trainable_params = model.count_parameters()
@@ -203,8 +249,17 @@ def main():
     start_epoch = 0
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
-        model.load_checkpoint(args.resume, device=str(device))
-        # TODO: Load optimizer and scheduler state
+        ckpt = model.load_checkpoint(args.resume, device=str(device))
+        if isinstance(ckpt, dict):
+            if 'optimizer_state_dict' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                logger.info("Loaded optimizer state from checkpoint")
+            if 'scheduler_state_dict' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                logger.info("Loaded scheduler state from checkpoint")
+            if 'epoch' in ckpt:
+                start_epoch = int(ckpt['epoch'])
+                logger.info(f"Resuming from epoch {start_epoch + 1}")
 
     # Training history
     history = {
@@ -217,18 +272,68 @@ def main():
     # Training loop
     best_val_acc = 0.0
 
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
         logger.info(f"\nEpoch {epoch}/{args.epochs}")
 
         # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, epoch, logger
-        )
+        # Train with optional AMP
+        model.train()
+        running_loss = 0.0
+        all_preds = []
+        all_labels = []
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch} [Train]')
+
+        for images, labels in pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            running_loss += loss.item() * images.size(0)
+            preds = torch.argmax(outputs, dim=1).detach().cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.detach().cpu().numpy())
+
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        train_loss = running_loss / len(train_loader.dataset)
+        train_acc = accuracy_score(all_labels, all_preds)
 
         # Validate
-        val_loss, val_acc, conf_mat = validate_epoch(
-            model, val_loader, criterion, device, epoch, logger
-        )
+        model.eval()
+        running_loss = 0.0
+        all_preds = []
+        all_labels = []
+
+        pbar = tqdm(val_loader, desc=f'Epoch {epoch} [Val]')
+        with torch.no_grad():
+            for images, labels in pbar:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                running_loss += loss.item() * images.size(0)
+                preds = torch.argmax(outputs, dim=1).detach().cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.detach().cpu().numpy())
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        val_loss = running_loss / len(val_loader.dataset)
+        val_acc = accuracy_score(all_labels, all_preds)
+        conf_mat = confusion_matrix(all_labels, all_preds)
 
         # Log metrics
         logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -246,6 +351,7 @@ def main():
             str(checkpoint_path),
             epoch=epoch,
             optimizer_state=optimizer.state_dict(),
+            scheduler_state=scheduler.state_dict(),
             metrics={'val_acc': val_acc, 'val_loss': val_loss}
         )
 

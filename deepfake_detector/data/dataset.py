@@ -135,13 +135,16 @@ class DeepFakeDataset(Dataset):
             image = transformed['image']
 
         # Create label (class index)
-        label = torch.tensor(int(fake_label), dtype=torch.long)
+        # Convention used across this repo:
+        #   1 = REAL (bona-fide)
+        #   0 = FAKE (deepfake)
+        label = torch.tensor(int(real_label), dtype=torch.long)
 
         return image, label
 
     def get_labels(self) -> np.ndarray:
         """Get all labels as numpy array."""
-        return self.data['fake'].values.astype(int)
+        return self.data['real'].values.astype(int)
 
     def get_class_weights(self) -> torch.Tensor:
         """
@@ -160,7 +163,8 @@ class DeepFakeDataset(Dataset):
 def create_combined_dataset(
     real_config: List[Tuple[str, int]],
     fake_config: List[Tuple[str, int]],
-    transform: Optional[Compose] = None
+    transform: Optional[Compose] = None,
+    return_paths: bool = False,
 ) -> Dataset:
     """
     Create a combined dataset with both real and fake samples.
@@ -189,16 +193,17 @@ def create_combined_dataset(
 
     # Create new dataset with combined data
     class CombinedDataset(Dataset):
-        def __init__(self, data, transform):
+        def __init__(self, data, transform, return_paths: bool = False):
             self.data = data
             self.transform = transform
+            self.return_paths = return_paths
 
         def __len__(self):
             return len(self.data)
 
         def __getitem__(self, idx):
             image_path = self.data.loc[idx, 'image_path']
-            fake_label = self.data.loc[idx, 'fake']
+            real_label = self.data.loc[idx, 'real']
 
             image_bgr = cv2.imread(image_path)
             if image_bgr is None:
@@ -210,7 +215,12 @@ def create_combined_dataset(
                 transformed = self.transform(image=image)
                 image = transformed['image']
 
-            label = torch.tensor(int(fake_label), dtype=torch.long)
+            # Convention used across this repo:
+            #   1 = REAL (bona-fide)
+            #   0 = FAKE (deepfake)
+            label = torch.tensor(int(real_label), dtype=torch.long)
+            if self.return_paths:
+                return image, label, image_path
             return image, label
 
-    return CombinedDataset(combined_data, transform)
+    return CombinedDataset(combined_data, transform, return_paths=return_paths)
