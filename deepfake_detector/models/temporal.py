@@ -314,7 +314,12 @@ class TemporalTriStreamDetector(nn.Module):
             # Phase 2: full temporal reasoning via Transformer
             video_repr = self.temporal(features)         # [B, D]
 
-        return self.classifier(video_repr)               # [B, out_dim]
+        logits = self.classifier(video_repr)               # [B, out_dim]
+        # For BCE path (FC(1)), make logits shape [B] to match targets shape [B].
+        # This avoids BCEWithLogitsLoss broadcasting/mismatch issues.
+        if self.bce_output:
+            logits = logits.squeeze(-1)                  # [B]
+        return logits
 
     def count_parameters(self) -> Tuple[int, int]:
         total = sum(p.numel() for p in self.parameters())
