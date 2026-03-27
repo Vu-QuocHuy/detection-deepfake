@@ -40,7 +40,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── CONFIG ───────────────────────────────────────────────────
+# Option A (default): one root containing train/val/test:
 DATA_ROOT="data/extracted"
+# Option B (your current layout): set explicit split roots via env vars:
+#   TRAIN_ROOT="D:/duong_huy_ct7/project-data/train"
+#   VAL_ROOT="D:/duong_huy_ct7/project-data/val"
+#   TEST_ROOT="D:/duong_huy_ct7/project-data/test"
+TRAIN_ROOT="${TRAIN_ROOT:-$DATA_ROOT/train}"
+VAL_ROOT="${VAL_ROOT:-$DATA_ROOT/val}"
+TEST_ROOT="${TEST_ROOT:-$DATA_ROOT/test}"
 OUTPUT_DIR="outputs/temporal_b4_T16"
 MODEL="efficientnet-b4"
 N_FRAMES=16                  # T=16 cố định — đủ bắt temporal artifact
@@ -68,17 +76,17 @@ FAKE_CLASSES=(
 TRAIN_FAKE_ARGS=""
 VAL_FAKE_ARGS=""
 for cls in "${FAKE_CLASSES[@]}"; do
-    if [ -d "$DATA_ROOT/train/$cls" ]; then
-        TRAIN_FAKE_ARGS+=" $DATA_ROOT/train/$cls"
+    if [ -d "$TRAIN_ROOT/$cls" ]; then
+        TRAIN_FAKE_ARGS+=" $TRAIN_ROOT/$cls"
     fi
-    if [ -d "$DATA_ROOT/val/$cls" ]; then
-        VAL_FAKE_ARGS+=" $DATA_ROOT/val/$cls"
+    if [ -d "$VAL_ROOT/$cls" ]; then
+        VAL_FAKE_ARGS+=" $VAL_ROOT/$cls"
     fi
 done
 
 # ── Kiểm tra dữ liệu ─────────────────────────────────────────
-if [ ! -d "$DATA_ROOT/train/original" ]; then
-    echo "ERROR: Không tìm thấy $DATA_ROOT/train/original"
+if [ ! -d "$TRAIN_ROOT/original" ]; then
+    echo "ERROR: Không tìm thấy $TRAIN_ROOT/original"
     echo "       Chạy scripts/run_pipeline.sh để extract dữ liệu trước."
     exit 1
 fi
@@ -114,9 +122,9 @@ fi
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 python3 scripts/train.py \
-    --train-real   "$DATA_ROOT/train/original" \
+    --train-real   "$TRAIN_ROOT/original" \
     --train-fake   $TRAIN_FAKE_ARGS \
-    --val-real     "$DATA_ROOT/val/original" \
+    --val-real     "$VAL_ROOT/original" \
     --val-fake     $VAL_FAKE_ARGS \
     --output-dir   "$OUTPUT_DIR" \
     --model        "$MODEL" \

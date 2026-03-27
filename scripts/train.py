@@ -53,7 +53,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.special import softmax
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
@@ -167,7 +173,9 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler,
 
     epoch_loss = running_loss / len(loader.dataset)
     epoch_acc  = accuracy_score(all_labels, all_preds)
-    return epoch_loss, epoch_acc
+    epoch_prec = precision_score(all_labels, all_preds, zero_division=0)
+    epoch_rec  = recall_score(all_labels, all_preds, zero_division=0)
+    return epoch_loss, epoch_acc, epoch_prec, epoch_rec
 
 
 @torch.no_grad()
@@ -477,7 +485,16 @@ def main():
                 start_epoch = int(ckpt["epoch"])
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    history = {"train_loss": [], "train_accuracy": [], "val_loss": [], "val_accuracy": []}
+    history = {
+        "train_loss": [],
+        "train_accuracy": [],
+        "train_precision": [],
+        "train_recall": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "val_precision": [],
+        "val_recall": [],
+    }
 
     for epoch in range(start_epoch + 1, total_epochs + 1):
         logger.info(f"\nEpoch {epoch}/{total_epochs}")
@@ -512,7 +529,7 @@ def main():
             )
 
         # Train
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, train_prec, train_rec = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler,
             scaler, device, epoch, bce_output
         )
@@ -524,25 +541,39 @@ def main():
 
         val_auc     = float(val_metrics.get("auc_roc", 0.0))
         opt_thr     = float(val_metrics.get("optimal_threshold", args.f1_threshold))
-        val_f1      = float(f1_score(labels_arr, (probs >= args.f1_threshold).astype(np.int64),
-                                      zero_division=0))
-        val_f1_opt  = float(f1_score(labels_arr, (probs >= opt_thr).astype(np.int64),
-                                      zero_division=0))
-        val_acc_opt = float(accuracy_score(labels_arr, (probs >= opt_thr).astype(np.int64)))
+        preds_thr = (probs >= args.f1_threshold).astype(np.int64)
+        preds_opt = (probs >= opt_thr).astype(np.int64)
 
-        logger.info(f"Train  loss={train_loss:.4f}  acc={train_acc:.4f}")
+        val_f1      = float(f1_score(labels_arr, preds_thr, zero_division=0))
+        val_prec    = float(precision_score(labels_arr, preds_thr, zero_division=0))
+        val_rec     = float(recall_score(labels_arr, preds_thr, zero_division=0))
+        val_f1_opt  = float(f1_score(labels_arr, preds_opt, zero_division=0))
+        val_prec_opt = float(precision_score(labels_arr, preds_opt, zero_division=0))
+        val_rec_opt  = float(recall_score(labels_arr, preds_opt, zero_division=0))
+        val_acc_opt = float(accuracy_score(labels_arr, preds_opt))
+
+        logger.info(
+            f"Train  loss={train_loss:.4f}  acc={train_acc:.4f}  "
+            f"P={train_prec:.4f}  R={train_rec:.4f}"
+        )
         logger.info(
             f"Val    loss={val_loss:.4f}  acc={val_acc:.4f}  "
             f"AUC={val_auc:.4f}  F1={val_f1:.4f}  "
-            f"F1@opt({opt_thr:.3f})={val_f1_opt:.4f}  acc@opt={val_acc_opt:.4f}"
+            f"P={val_prec:.4f}  R={val_rec:.4f}  "
+            f"F1@opt({opt_thr:.3f})={val_f1_opt:.4f}  "
+            f"P@opt={val_prec_opt:.4f}  R@opt={val_rec_opt:.4f}  acc@opt={val_acc_opt:.4f}"
         )
         logger.info(f"Confusion matrix:\n{conf_mat}")
 
         phase_tag = f"P{current_phase}"
         history["train_loss"].append(train_loss)
         history["train_accuracy"].append(train_acc)
+        history["train_precision"].append(train_prec)
+        history["train_recall"].append(train_rec)
         history["val_loss"].append(val_loss)
         history["val_accuracy"].append(val_acc)
+        history["val_precision"].append(val_prec)
+        history["val_recall"].append(val_rec)
 
         # Save per-epoch checkpoint (tagged with phase)
         ckpt_path = ckpt_dir / f"epoch_{epoch:03d}_{phase_tag}.pth"
@@ -555,7 +586,10 @@ def main():
                 "phase": current_phase,
                 "val_acc": val_acc, "val_loss": val_loss,
                 "val_auc": val_auc, "val_f1": val_f1,
-                "val_f1_opt": val_f1_opt, "val_acc_opt": val_acc_opt,
+                "val_precision": val_prec, "val_recall": val_rec,
+                "val_f1_opt": val_f1_opt,
+                "val_precision_opt": val_prec_opt, "val_recall_opt": val_rec_opt,
+                "val_acc_opt": val_acc_opt,
                 "val_optimal_threshold": opt_thr,
             },
         )
@@ -576,7 +610,7 @@ def main():
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_training_history(
         history,
-        metrics=["loss", "accuracy"],
+        metrics=["loss", "accuracy", "precision", "recall"],
         save_path=str(results_dir / "training_history.png"),
         show=False,
     )
