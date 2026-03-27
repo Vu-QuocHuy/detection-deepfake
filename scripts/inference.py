@@ -1,220 +1,217 @@
 #!/usr/bin/env python3
 """
-Inference Script for DeepFake Detection
-Run inference on single images or directories.
+Inference Script — TemporalTriStreamDetector
+=============================================
+Run video-level deepfake detection on:
+  • A directory of face-crop images (extracted from one video)
+  • A parent directory containing multiple per-video subdirectories
+
+The model requires a sequence of T frames per video.
+If a directory has more than T images, T are sampled uniformly.
+If fewer than T, the last frame is repeated to pad.
+
+Usage examples:
+  # Single video (directory of face crops)
+  python scripts/inference.py \\
+    --input data/extracted/test/Deepfakes/video_001 \\
+    --checkpoint outputs/temporal_b4_T16/checkpoints/best_model.pth
+
+  # Multiple videos (parent directory with per-video subdirs)
+  python scripts/inference.py \\
+    --input data/extracted/test/Deepfakes \\
+    --checkpoint outputs/temporal_b4_T16/checkpoints/best_model.pth \\
+    --output results.csv
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import torch
 import cv2
 import numpy as np
-from scipy.special import softmax
-import glob
+import pandas as pd
+import torch
 from tqdm import tqdm
 
-from deepfake_detector.models import DeepFakeDetector, TriStreamDeepFakeDetector
 from deepfake_detector.data import get_val_transforms
+from deepfake_detector.models.multistream import _effnet_input_size
+from deepfake_detector.models.temporal import TemporalTriStreamDetector
 from deepfake_detector.utils import setup_logger
 
-
-def load_image(image_path, transform):
-    """Load and preprocess an image."""
-    image_bgr = cv2.imread(image_path)
-
-    if image_bgr is None:
-        raise ValueError(f"Failed to load image: {image_path}")
-
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-    # Apply transforms
-    transformed = transform(image=image_rgb)
-    image_tensor = transformed['image'].unsqueeze(0)
-
-    return image_tensor
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
-def predict_single(model, image_tensor, device):
-    """Run prediction on a single image."""
+def _load_frames(frame_paths: list[str], transform, n_frames: int) -> torch.Tensor:
+    """
+    Load exactly n_frames from frame_paths into [1, T, 3, H, W].
+    Uniform sampling if len > n_frames, pad with last frame if len < n_frames.
+    """
+    paths = sorted(frame_paths)
+    total = len(paths)
+
+    if total == 0:
+        raise ValueError("No frames found")
+
+    if total >= n_frames:
+        indices = np.linspace(0, total - 1, n_frames, dtype=int)
+    else:
+        indices = list(range(total)) + [total - 1] * (n_frames - total)
+
+    frames = []
+    for i in indices:
+        img = cv2.imread(paths[i])
+        if img is None:
+            img = cv2.imread(paths[min(i + 1, total - 1)])
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        t = transform(image=img_rgb)["image"]   # [3, H, W]
+        frames.append(t)
+
+    seq = torch.stack(frames, dim=0).unsqueeze(0)   # [1, T, 3, H, W]
+    return seq
+
+
+@torch.no_grad()
+def predict_video(model: TemporalTriStreamDetector, seq: torch.Tensor,
+                  device: torch.device, bce_output: bool, threshold: float):
+    """
+    Returns (label, prob_fake, prob_real).
+    prob_real = P(real), prob_fake = P(fake).
+    """
     model.eval()
+    seq = seq.to(device)
+    logit = model(seq)
 
-    with torch.no_grad():
-        image_tensor = image_tensor.to(device)
-        output = model(image_tensor)
-        probs = softmax(output.cpu().numpy(), axis=1)[0]
+    if bce_output:
+        prob_real = torch.sigmoid(logit.squeeze()).item()
+    else:
+        import torch.nn.functional as F
+        prob_real = F.softmax(logit, dim=1)[0, 1].item()
 
-    return probs
+    prob_fake = 1.0 - prob_real
+    label = "REAL" if prob_real >= threshold else "FAKE"
+    return label, prob_fake, prob_real
+
+
+def get_video_dirs(input_path: Path) -> list[tuple[str, Path]]:
+    """
+    Return list of (video_name, dir_path).
+    If input_path itself contains images → treat as single video.
+    If input_path contains subdirs → treat each subdir as a video.
+    """
+    direct_images = [p for p in input_path.iterdir()
+                     if p.is_file() and p.suffix.lower() in IMG_EXTS]
+    if direct_images:
+        return [(input_path.name, input_path)]
+
+    subdirs = sorted([p for p in input_path.iterdir() if p.is_dir()])
+    return [(d.name, d) for d in subdirs]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='DeepFake Detection Inference',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="DeepFake Inference — TemporalTriStreamDetector",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    parser.add_argument('--input', type=str, required=True,
-                        help='Input image or directory')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint')
-    parser.add_argument('--model', type=str, default='efficientnet-b1',
-                        help='Model architecture')
-    parser.add_argument('--multistream', action='store_true',
-                        help='Use tri-stream RGB+frequency+SRM-like detector')
-    parser.add_argument('--freq-model', type=str, default='efficientnet-b2',
-                        help='EfficientNet variant for frequency stream')
-    parser.add_argument('--srm-model', type=str, default='efficientnet-b0',
-                        help='EfficientNet variant for SRM-like stream')
-    parser.add_argument('--srm-filters', type=int, default=30,
-                        help='Number of learnable SRM filters (noise channels)')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Classification threshold')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output file for batch inference results')
+    parser.add_argument("--input",      type=str, required=True,
+                        help="Directory of face crops (single video) or parent dir (multiple videos)")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to trained TemporalTriStreamDetector checkpoint")
+    parser.add_argument("--model",      type=str, default="efficientnet-b4",
+                        help="EfficientNet backbone (overridden by checkpoint if available)")
+    parser.add_argument("--n-frames",   type=int, default=16,
+                        help="T frames per video (overridden by checkpoint if available)")
+    parser.add_argument("--threshold",  type=float, default=0.5,
+                        help="P(real) threshold: >= threshold → REAL")
+    parser.add_argument("--output",     type=str, default=None,
+                        help="Save results to CSV (optional)")
 
     args = parser.parse_args()
 
-    # Setup logger
-    logger = setup_logger(name='inference', level='INFO')
-
-    logger.info("="*60)
+    logger = setup_logger(name="inference", level="INFO")
+    logger.info("=" * 60)
     logger.info("DeepFake Detection Inference")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
 
-    # Load model
-    logger.info(f"Loading model from: {args.checkpoint}")
+    # ── Load checkpoint ───────────────────────────────────────────────────────
+    logger.info(f"Loading: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    backbone   = ckpt.get("backbone",   args.model)
+    n_frames   = ckpt.get("n_frames",   args.n_frames)
+    bce_output = ckpt.get("bce_output", True)
+    logger.info(f"  backbone={backbone}  n_frames={n_frames}  bce={bce_output}")
 
-    def _effnet_input_size(model_name: str) -> int:
-        name = model_name.lower()
-        if "b0" in name:
-            return 224
-        if "b1" in name:
-            return 240
-        if "b2" in name:
-            return 260
-        if "b3" in name:
-            return 300
-        if "b4" in name:
-            return 380
-        if "b5" in name:
-            return 456
-        if "b6" in name:
-            return 528
-        if "b7" in name:
-            return 600
-        return 224
-
-    if args.multistream:
-        model = TriStreamDeepFakeDetector(
-            rgb_model=args.model,
-            freq_model=args.freq_model,
-            srm_model=args.srm_model,
-            srm_filters=args.srm_filters,
-            pretrained=False,
-        )
-    else:
-        model = DeepFakeDetector(model_name=args.model, pretrained=False)
-
-    model.load_checkpoint(args.checkpoint, device=str(device))
+    model = TemporalTriStreamDetector(
+        backbone=backbone,
+        n_frames=n_frames,
+        bce_output=bce_output,
+        pretrained=False,
+    )
+    model.load_state_dict(ckpt.get("model_state_dict", ckpt))
     model = model.to(device)
-    model.eval()
 
-    # Prepare transform
-    image_size = _effnet_input_size(args.model)
-    transform = get_val_transforms(image_size)
+    image_size = _effnet_input_size(backbone)
+    transform  = get_val_transforms(image_size)
 
-    # Check if input is file or directory
+    # ── Collect videos ────────────────────────────────────────────────────────
     input_path = Path(args.input)
-
-    if input_path.is_file():
-        # Single image inference
-        logger.info(f"Running inference on: {input_path}")
-
-        image_tensor = load_image(str(input_path), transform)
-        probs = predict_single(model, image_tensor, device)
-
-        fake_prob = probs[0]
-        real_prob = probs[1]
-        prediction = "REAL" if real_prob >= args.threshold else "FAKE"
-
-        print("\n" + "="*60)
-        print(f"Image: {input_path.name}")
-        print(f"Prediction: {prediction}")
-        print(f"Confidence: {max(fake_prob, real_prob):.2%}")
-        print(f"Real probability: {real_prob:.4f}")
-        print(f"Fake probability: {fake_prob:.4f}")
-        print("="*60 + "\n")
-
-    elif input_path.is_dir():
-        # Batch inference on directory
-        logger.info(f"Running batch inference on directory: {input_path}")
-
-        # Get all images
-        image_files = []
-        for ext in ['*.jpg', '*.jpeg', '*.png']:
-            image_files.extend(glob.glob(str(input_path / ext)))
-
-        if not image_files:
-            logger.error(f"No images found in {input_path}")
-            return
-
-        logger.info(f"Found {len(image_files)} images")
-
-        results = []
-
-        for image_path in tqdm(image_files, desc='Processing'):
-            try:
-                image_tensor = load_image(image_path, transform)
-                probs = predict_single(model, image_tensor, device)
-
-                fake_prob = probs[0]
-                real_prob = probs[1]
-                prediction = "REAL" if real_prob >= args.threshold else "FAKE"
-
-                results.append({
-                    'image': Path(image_path).name,
-                    'prediction': prediction,
-                    'real_prob': real_prob,
-                    'fake_prob': fake_prob,
-                    'confidence': max(fake_prob, real_prob)
-                })
-
-            except Exception as e:
-                logger.error(f"Error processing {image_path}: {e}")
-                continue
-
-        # Print summary
-        print("\n" + "="*60)
-        print("Batch Inference Results")
-        print("="*60)
-        print(f"Total images: {len(results)}")
-        real_count = sum(1 for r in results if r['prediction'] == 'REAL')
-        fake_count = sum(1 for r in results if r['prediction'] == 'FAKE')
-        print(f"Predicted REAL: {real_count}")
-        print(f"Predicted FAKE: {fake_count}")
-        print("="*60 + "\n")
-
-        # Save results if output specified
-        if args.output:
-            import pandas as pd
-            df = pd.DataFrame(results)
-            df.to_csv(args.output, index=False)
-            logger.info(f"Results saved to: {args.output}")
-
-    else:
-        logger.error(f"Invalid input path: {input_path}")
+    if not input_path.is_dir():
+        logger.error(f"Input must be a directory: {input_path}")
         return
 
-    logger.info("Inference complete!")
+    videos = get_video_dirs(input_path)
+    logger.info(f"Found {len(videos)} video(s) in {input_path}")
+
+    results = []
+    for vid_name, vid_dir in tqdm(videos, desc="Processing"):
+        frame_paths = [str(p) for p in vid_dir.iterdir()
+                       if p.is_file() and p.suffix.lower() in IMG_EXTS]
+        if not frame_paths:
+            logger.warning(f"No images in {vid_dir}, skipping.")
+            continue
+
+        try:
+            seq = _load_frames(frame_paths, transform, n_frames)
+            label, prob_fake, prob_real = predict_video(
+                model, seq, device, bce_output, args.threshold
+            )
+            results.append({
+                "video":      vid_name,
+                "prediction": label,
+                "prob_real":  round(prob_real, 4),
+                "prob_fake":  round(prob_fake, 4),
+                "confidence": round(max(prob_real, prob_fake), 4),
+            })
+        except Exception as e:
+            logger.error(f"Error on {vid_dir}: {e}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Inference Results")
+    print("=" * 60)
+    total = len(results)
+    n_real = sum(1 for r in results if r["prediction"] == "REAL")
+    n_fake = total - n_real
+    print(f"Total videos  : {total}")
+    print(f"Predicted REAL: {n_real}")
+    print(f"Predicted FAKE: {n_fake}")
+    print("=" * 60)
+
+    if total <= 20:
+        for r in results:
+            print(f"  {r['video']:40s}  {r['prediction']}  "
+                  f"(real={r['prob_real']:.3f}, fake={r['prob_fake']:.3f})")
+
+    if args.output:
+        pd.DataFrame(results).to_csv(args.output, index=False)
+        logger.info(f"Results saved to: {args.output}")
+
+    logger.info("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

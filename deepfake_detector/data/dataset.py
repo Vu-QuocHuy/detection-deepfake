@@ -1,40 +1,82 @@
 """
-Dataset class for DeepFake Detection
-Handles loading and preprocessing of facial images.
+VideoSequenceDataset — load N frames per video as a temporal sequence.
+
+Frame naming convention (from extract_faces.py):
+    {video_stem}-{timestamp}.jpg
+
+Groups frames by video_stem, returns [T, 3, H, W] tensors for
+temporal modeling.
 """
+
+from __future__ import annotations
 
 import os
 import glob
-from typing import List, Tuple, Optional, Callable
+import random
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
 from albumentations import Compose
+from torch.utils.data import Dataset
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class DeepFakeDataset(Dataset):
+def _extract_video_id(filename: str) -> str:
     """
-    PyTorch Dataset for DeepFake Detection.
+    Recover video stem from extracted face filename.
+    Expected: {video_stem}-{timestamp}.jpg
+    """
+    stem = Path(filename).stem
+    if '-' in stem:
+        return stem.rsplit('-', 1)[0]
+    return stem
 
-    Supports multiple data directories and balanced sampling.
+
+def _build_video_index(
+    directory: str,
+    image_extensions: Tuple[str, ...] = ('.jpg', '.jpeg', '.png'),
+) -> Dict[str, List[str]]:
+    """
+    Scan directory and group image paths by video_id.
+    Returns: {video_id: [sorted list of frame paths]}
+    """
+    video_frames: Dict[str, List[str]] = defaultdict(list)
+    for ext in image_extensions:
+        for fpath in glob.glob(os.path.join(directory, f'*{ext}')):
+            vid_id = _extract_video_id(os.path.basename(fpath))
+            video_frames[vid_id].append(fpath)
+
+    # Sort frames within each video for consistent ordering
+    for vid_id in video_frames:
+        video_frames[vid_id].sort()
+
+    return dict(video_frames)
+
+
+class VideoSequenceDataset(Dataset):
+    """
+    Dataset that returns a temporal sequence of face crops per video.
+
+    Each sample is ([T, 3, H, W], label) where T = n_frames_per_video.
+
+    Frame selection strategy:
+      - 'uniform':  evenly spaced T frames from the sorted list
+      - 'random':   T random frames (for augmentation during training)
 
     Args:
-        data_config: List of tuples [(directory_path, num_samples), ...]
-        is_real: Whether this dataset contains real (True) or fake (False) images
-        transform: Albumentations transform composition
-        image_extensions: Tuple of supported image extensions
-
-    Example:
-        >>> config = [("/path/to/real", 1000), ("/path/to/real2", 500)]
-        >>> dataset = DeepFakeDataset(config, is_real=True, transform=transforms)
-        >>> image, label = dataset[0]
+        data_config:       [(directory, max_samples), ...]
+        is_real:           True for real class, False for fake
+        transform:         Per-frame albumentations transform
+        n_frames:          Number of frames to return per video
+        sampling:          'uniform' or 'random'
+        min_frames:        Skip videos with fewer than this many extracted frames
     """
 
     def __init__(
@@ -42,185 +84,133 @@ class DeepFakeDataset(Dataset):
         data_config: List[Tuple[str, int]],
         is_real: bool = True,
         transform: Optional[Compose] = None,
-        image_extensions: Tuple[str, ...] = ('.jpg', '.jpeg', '.png')
+        n_frames: int = 8,
+        sampling: str = 'uniform',
+        min_frames: int = 2,
     ):
-        super().__init__()
-
-        self.data_config = data_config
         self.is_real = is_real
         self.transform = transform
-        self.image_extensions = image_extensions
+        self.n_frames = n_frames
+        self.sampling = sampling
+        self.label = 1 if is_real else 0
 
-        # Build dataset
-        self.data = self._build_dataset()
+        self.samples: List[Tuple[str, List[str]]] = []  # (video_id, [frame_paths])
+
+        for directory, max_samples in data_config:
+            if not os.path.exists(directory):
+                logger.warning(f"Directory not found: {directory}")
+                continue
+
+            video_index = _build_video_index(directory)
+            valid = {
+                vid: frames
+                for vid, frames in video_index.items()
+                if len(frames) >= min_frames
+            }
+
+            items = [(vid, frames) for vid, frames in valid.items()]
+            random.shuffle(items)
+
+            if max_samples > 0:
+                items = items[:max_samples]
+
+            self.samples.extend(items)
+            logger.info(
+                f"{'Real' if is_real else 'Fake'} {directory}: "
+                f"{len(items)} videos, "
+                f"avg {np.mean([len(f) for _, f in items]):.1f} frames/video"
+            )
 
         logger.info(
-            f"{'Real' if is_real else 'Fake'} dataset initialized: "
-            f"{len(self.data)} samples"
+            f"VideoSequenceDataset ({'real' if is_real else 'fake'}): "
+            f"{len(self.samples)} videos total"
         )
 
-    def _build_dataset(self) -> pd.DataFrame:
-        """Build dataset from configuration."""
-        all_data = []
-
-        for directory, sample_num in self.data_config:
-            if not os.path.exists(directory):
-                logger.warning(f"Directory not found: {directory}, skipping...")
-                continue
-
-            # Collect all image paths
-            image_paths = []
-            for ext in self.image_extensions:
-                image_paths.extend(glob.glob(os.path.join(directory, f'*{ext}')))
-
-            if len(image_paths) == 0:
-                logger.warning(f"No images found in {directory}")
-                continue
-
-            # Create dataframe
-            df = pd.DataFrame(image_paths, columns=['image_path'])
-            df['real'] = 1.0 if self.is_real else 0.0
-            df['fake'] = 0.0 if self.is_real else 1.0
-
-            # Sample if necessary
-            if sample_num > 0 and len(df) >= sample_num:
-                df = df.sample(n=sample_num, random_state=42, replace=False)
-            elif sample_num > len(df):
-                logger.warning(
-                    f"Requested {sample_num} samples but only {len(df)} available in {directory}"
-                )
-
-            all_data.append(df)
-
-            logger.debug(f"Loaded {len(df)} samples from {directory}")
-
-        if not all_data:
-            raise ValueError("No valid data found in any directory")
-
-        return pd.concat(all_data, ignore_index=True)
-
     def __len__(self) -> int:
-        """Return dataset size."""
-        return len(self.data)
+        return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get item by index.
+    def _select_frames(self, frame_paths: List[str]) -> List[str]:
+        n = len(frame_paths)
+        if n <= self.n_frames:
+            # Pad by repeating last frame
+            selected = frame_paths + [frame_paths[-1]] * (self.n_frames - n)
+        elif self.sampling == 'random':
+            idx = sorted(random.sample(range(n), self.n_frames))
+            selected = [frame_paths[i] for i in idx]
+        else:  # uniform
+            idx = np.linspace(0, n - 1, self.n_frames).astype(int)
+            selected = [frame_paths[i] for i in idx]
+        return selected
 
-        Args:
-            idx: Index of the sample
-
-        Returns:
-            Tuple of (image_tensor, label_tensor)
-        """
-        # Get image path and labels
-        image_path = self.data.loc[idx, 'image_path']
-        real_label = self.data.loc[idx, 'real']
-        fake_label = self.data.loc[idx, 'fake']
-
-        # Load image
-        image_bgr = cv2.imread(image_path)
-
-        if image_bgr is None:
-            logger.error(f"Failed to load image: {image_path}")
-            # Return a black image as fallback
-            image = np.zeros((224, 224, 3), dtype=np.uint8)
+    def _load_frame(self, path: str) -> np.ndarray:
+        img = cv2.imread(path)
+        if img is None:
+            img = np.zeros((224, 224, 3), dtype=np.uint8)
         else:
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
-        # Apply transforms
-        if self.transform is not None:
-            transformed = self.transform(image=image)
-            image = transformed['image']
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        video_id, frame_paths = self.samples[idx]
+        selected = self._select_frames(frame_paths)
 
-        # Create label (class index)
-        # Convention used across this repo:
-        #   1 = REAL (bona-fide)
-        #   0 = FAKE (deepfake)
-        label = torch.tensor(int(real_label), dtype=torch.long)
+        frames = []
+        for fpath in selected:
+            img = self._load_frame(fpath)
+            if self.transform is not None:
+                img = self.transform(image=img)['image']  # [3, H, W] tensor
+            frames.append(img)
 
-        return image, label
-
-    def get_labels(self) -> np.ndarray:
-        """Get all labels as numpy array."""
-        return self.data['real'].values.astype(int)
-
-    def get_class_weights(self) -> torch.Tensor:
-        """
-        Calculate class weights for balanced training.
-
-        Returns:
-            Tensor of class weights
-        """
-        labels = self.get_labels()
-        class_counts = np.bincount(labels)
-        total = len(labels)
-        weights = total / (len(class_counts) * class_counts)
-        return torch.tensor(weights, dtype=torch.float32)
+        # Stack → [T, 3, H, W]
+        sequence = torch.stack(frames, dim=0)
+        return sequence, self.label
 
 
-def create_combined_dataset(
+def create_video_dataset(
     real_config: List[Tuple[str, int]],
     fake_config: List[Tuple[str, int]],
     transform: Optional[Compose] = None,
-    return_paths: bool = False,
-) -> Dataset:
+    n_frames: int = 8,
+    sampling: str = 'uniform',
+) -> 'CombinedVideoDataset':
     """
-    Create a combined dataset with both real and fake samples.
-
-    Args:
-        real_config: Configuration for real images
-        fake_config: Configuration for fake images
-        transform: Transform to apply
-
-    Returns:
-        Combined dataset
-
-    Example:
-        >>> real_cfg = [("/path/real", 1000)]
-        >>> fake_cfg = [("/path/fake", 1000)]
-        >>> dataset = create_combined_dataset(real_cfg, fake_cfg, transforms)
+    Create combined real+fake VideoSequenceDataset.
     """
-    real_dataset = DeepFakeDataset(real_config, is_real=True, transform=transform)
-    fake_dataset = DeepFakeDataset(fake_config, is_real=False, transform=transform)
-
-    # Combine datasets
-    combined_data = pd.concat(
-        [real_dataset.data, fake_dataset.data],
-        ignore_index=True
+    real_ds = VideoSequenceDataset(
+        real_config, is_real=True, transform=transform,
+        n_frames=n_frames, sampling=sampling
     )
+    fake_ds = VideoSequenceDataset(
+        fake_config, is_real=False, transform=transform,
+        n_frames=n_frames, sampling=sampling
+    )
+    return CombinedVideoDataset(real_ds, fake_ds)
 
-    # Create new dataset with combined data
-    class CombinedDataset(Dataset):
-        def __init__(self, data, transform, return_paths: bool = False):
-            self.data = data
-            self.transform = transform
-            self.return_paths = return_paths
 
-        def __len__(self):
-            return len(self.data)
+class CombinedVideoDataset(Dataset):
+    """Concatenates real and fake VideoSequenceDatasets."""
 
-        def __getitem__(self, idx):
-            image_path = self.data.loc[idx, 'image_path']
-            real_label = self.data.loc[idx, 'real']
+    def __init__(self, real_ds: VideoSequenceDataset, fake_ds: VideoSequenceDataset):
+        self.datasets = [real_ds, fake_ds]
+        self._lengths = [len(real_ds), len(fake_ds)]
+        self._offsets = [0, len(real_ds)]
 
-            image_bgr = cv2.imread(image_path)
-            if image_bgr is None:
-                image = np.zeros((224, 224, 3), dtype=np.uint8)
-            else:
-                image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        # Build label array for WeightedRandomSampler
+        labels_real = [1] * len(real_ds)
+        labels_fake = [0] * len(fake_ds)
+        self.labels = labels_real + labels_fake
 
-            if self.transform is not None:
-                transformed = self.transform(image=image)
-                image = transformed['image']
+        logger.info(
+            f"CombinedVideoDataset: {len(real_ds)} real + {len(fake_ds)} fake "
+            f"= {len(self)} total videos"
+        )
 
-            # Convention used across this repo:
-            #   1 = REAL (bona-fide)
-            #   0 = FAKE (deepfake)
-            label = torch.tensor(int(real_label), dtype=torch.long)
-            if self.return_paths:
-                return image, label, image_path
-            return image, label
+    def __len__(self) -> int:
+        return sum(self._lengths)
 
-    return CombinedDataset(combined_data, transform, return_paths=return_paths)
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        for ds, offset in zip(self.datasets, self._offsets):
+            if idx < offset + len(ds):
+                return ds[idx - offset]
+            # idx is beyond this dataset, continue
+        raise IndexError(f"Index {idx} out of range")

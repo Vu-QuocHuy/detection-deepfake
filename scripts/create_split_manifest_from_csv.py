@@ -83,9 +83,12 @@ def main():
     parser.add_argument("--dataset-root", type=str, required=True, help="Dataset root folder containing video subfolders")
     parser.add_argument("--csv-dir", type=str, required=True, help="Folder containing CSV files")
     parser.add_argument("--csv-files", type=str, nargs="*", default=None, help="Optional explicit CSV filenames")
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--train-ratio", type=float, default=0.72,
+                        help="Train split ratio (default 0.72 → ~720/1000 videos)")
+    parser.add_argument("--val-ratio", type=float, default=0.14,
+                        help="Val split ratio  (default 0.14 → ~140/1000 videos)")
+    parser.add_argument("--test-ratio", type=float, default=0.14,
+                        help="Test split ratio (default 0.14 → ~140/1000 videos)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, required=True, help="Output split manifest JSON")
     args = parser.parse_args()
@@ -116,7 +119,11 @@ def main():
 
     for csv_path in csv_paths:
         df = _read_csv_flexible(csv_path)
-        file_col = _find_col(df, ["File Path", "filepath", "path", "file_path"])
+        try:
+            file_col = _find_col(df, ["File Path", "filepath", "path", "file_path"])
+        except ValueError:
+            print(f"[SKIP] {csv_path.name} — khong co cot 'File Path', bo qua (co the la file thong ke)")
+            continue
         label_col = None
         try:
             label_col = _find_col(df, ["Label", "label"])

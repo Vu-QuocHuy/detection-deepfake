@@ -1,379 +1,589 @@
 #!/usr/bin/env python3
 """
-Training script for DeepFake Detection
-Robust training with checkpointing, logging, and monitoring.
+Temporal DeepFake Detection Training
+=====================================
+Trains TemporalTriStreamDetector on video sequences (T=16 frames/video).
+
+2-Phase training strategy (recommended):
+  Phase 1 (--phase1-epochs, default=8):
+    → Freeze Temporal Transformer.
+    → Forward uses MEAN-POOL of frame features (no Transformer interference).
+    → Only spatial encoder + channel attention + FC(1) update.
+    → Spatial features become meaningful per-frame representations first.
+
+  Phase 2 (--phase2-epochs, default=25):
+    → Unfreeze ALL parameters (spatial + Transformer + classifier).
+    → Full temporal forward via Transformer.
+    → Transformer learns to aggregate already-good spatial features.
+    → Use lower LR for spatial backbone (--lr-backbone).
+
+Usage example (local RTX 5060 Ti 16GB):
+  python scripts/train.py \\
+    --train-real  data/extracted/train/original \\
+    --train-fake  data/extracted/train/DeepFakeDetection \\
+                  data/extracted/train/Deepfakes \\
+                  data/extracted/train/Face2Face \\
+                  data/extracted/train/FaceShifter \\
+                  data/extracted/train/FaceSwap \\
+                  data/extracted/train/NeuralTextures \\
+    --val-real    data/extracted/val/original \\
+    --val-fake    data/extracted/val/DeepFakeDetection \\
+    --output-dir  outputs/temporal \\
+    --model       efficientnet-b4 \\
+    --n-frames    16 \\
+    --phase1-epochs 8 \\
+    --phase2-epochs 25 \\
+    --batch-size  2 \\
+    --amp \\
+    --focal-loss \\
+    --balanced-sampler \\
+    --grad-checkpoint
 """
 
 import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import numpy as np
+import torch.nn.functional as F
+from scipy.special import softmax
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, confusion_matrix
+from transformers import get_cosine_schedule_with_warmup
 
-# Import from our package
-from deepfake_detector.models import DeepFakeDetector, TriStreamDeepFakeDetector
-from deepfake_detector.data import create_combined_dataset, get_train_transforms, get_val_transforms, create_dataloaders
-from deepfake_detector.utils import setup_logger, calculate_comprehensive_metrics, plot_confusion_matrix, plot_training_history
-from deepfake_detector.config import Config, load_config
-
-from transformers import AdamW, get_cosine_schedule_with_warmup
-
-
-def _effnet_input_size(model_name: str) -> int:
-    name = model_name.lower()
-    if "b0" in name:
-        return 224
-    if "b1" in name:
-        return 240
-    if "b2" in name:
-        return 260
-    if "b3" in name:
-        return 300
-    if "b4" in name:
-        return 380
-    if "b5" in name:
-        return 456
-    if "b6" in name:
-        return 528
-    if "b7" in name:
-        return 600
-    return 224
+from deepfake_detector.data import get_train_transforms, get_val_transforms
+from deepfake_detector.data.dataset import (
+    CombinedVideoDataset,
+    VideoSequenceDataset,
+)
+from deepfake_detector.models.multistream import _effnet_feat_dim, _effnet_input_size
+from deepfake_detector.models.temporal import TemporalTriStreamDetector
+from deepfake_detector.utils import (
+    calculate_comprehensive_metrics,
+    plot_training_history,
+    setup_logger,
+)
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, logger):
-    """Train for one epoch."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Loss functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al., 2017) for FC(2) + CrossEntropy path."""
+
+    def __init__(self, gamma: float = 2.0, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce)
+        return ((1.0 - pt) ** self.gamma * ce).mean()
+
+
+class FocalBCELoss(nn.Module):
+    """
+    Focal Loss for FC(1) + BCE path (binary classification).
+    FL(p) = -alpha * (1-p)^gamma * log(p)
+
+    pos_weight balances class imbalance (= neg_count / pos_count).
+    gamma focuses training on hard examples.
+    """
+
+    def __init__(self, gamma: float = 2.0, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits: [B, 1] or [B],  targets: [B] float (0.0 or 1.0)
+        logits = logits.squeeze(-1)
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets.float(), pos_weight=self.pos_weight, reduction="none"
+        )
+        p = torch.sigmoid(logits)
+        pt = targets * p + (1 - targets) * (1 - p)   # prob of correct class
+        return ((1.0 - pt) ** self.gamma * bce).mean()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Training helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_preds_probs(logits: torch.Tensor, bce_output: bool):
+    """
+    Convert raw logits to (preds [B], probs_real [B]) based on output mode.
+    bce_output=True : logits [B,1] → sigmoid → prob_real; pred = (prob > 0.5)
+    bce_output=False: logits [B,2] → softmax → prob_real = col 1
+    """
+    if bce_output:
+        logits = logits.squeeze(-1)
+        probs = torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+        preds = (probs >= 0.5).astype(np.int64)
+    else:
+        logits_np = logits.cpu().numpy().astype(np.float64)
+        probs = softmax(logits_np, axis=1)[:, 1]
+        preds = np.argmax(logits_np, axis=1)
+    return preds, probs
+
+
+def train_one_epoch(model, loader, criterion, optimizer, scheduler,
+                    scaler, device, epoch, bce_output: bool):
     model.train()
     running_loss = 0.0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
 
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
+    for seqs, labels in pbar:
+        seqs   = seqs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-    for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        with torch.amp.autocast('cuda', enabled=scaler.is_enabled()):
+            logits = model(seqs)
+            loss   = criterion(logits, labels)
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
 
-        # Metrics
-        running_loss += loss.item() * images.size(0)
-        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+        running_loss += loss.item() * seqs.size(0)
+        preds, _ = _get_preds_probs(logits.detach(), bce_output)
         all_preds.extend(preds)
-        all_labels.extend(labels.cpu().numpy())
-
-        # Update progress bar
+        all_labels.extend(labels.detach().cpu().numpy())
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc  = accuracy_score(all_labels, all_preds)
     return epoch_loss, epoch_acc
 
 
-def validate_epoch(model, dataloader, criterion, device, epoch, logger):
-    """Validate for one epoch."""
+@torch.no_grad()
+def validate_one_epoch(model, loader, criterion, device, epoch, bce_output: bool):
     model.eval()
     running_loss = 0.0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels, all_probs = [], [], []
 
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]")
+    for seqs, labels in pbar:
+        seqs   = seqs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-    with torch.no_grad():
-        for images, labels in pbar:
-            images = images.to(device)
-            labels = labels.to(device)
+        logits = model(seqs)
+        loss   = criterion(logits, labels)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        running_loss += loss.item() * seqs.size(0)
+        preds, probs = _get_preds_probs(logits, bce_output)
+        all_probs.extend(probs)
+        all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy())
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-            running_loss += loss.item() * images.size(0)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
+    epoch_loss = running_loss / len(loader.dataset)
+    labels_arr = np.asarray(all_labels, dtype=np.int64)
+    epoch_acc  = accuracy_score(labels_arr, all_preds)
+    conf_mat   = confusion_matrix(labels_arr, all_preds)
+    probs_arr  = np.asarray(all_probs, dtype=np.float64)
+    metrics    = calculate_comprehensive_metrics(probs=probs_arr, labels=labels_arr)
 
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    return epoch_loss, epoch_acc, conf_mat, metrics, probs_arr, labels_arr
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    conf_mat = confusion_matrix(all_labels, all_preds)
 
-    return epoch_loss, epoch_acc, conf_mat
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Train DeepFake Detection Model',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Train Temporal TriStream DeepFake Detector",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file')
-    parser.add_argument('--train-real', type=str, nargs='+', required=True,
-                        help='Paths to training real images directories')
-    parser.add_argument('--train-fake', type=str, nargs='+', required=True,
-                        help='Paths to training fake images directories')
-    parser.add_argument('--val-real', type=str, nargs='+', required=True,
-                        help='Paths to validation real images directories')
-    parser.add_argument('--val-fake', type=str, nargs='+', required=True,
-                        help='Paths to validation fake images directories')
-    parser.add_argument('--output-dir', type=str, default='outputs',
-                        help='Output directory for checkpoints and logs')
-    parser.add_argument('--batch-size', type=int, default=8,
-                        help='Batch size')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of DataLoader workers')
-    parser.add_argument('--epochs', type=int, default=20,
-                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=8e-4,
-                        help='Learning rate')
-    parser.add_argument('--model', type=str, default='efficientnet-b1',
-                        help='Model architecture')
-    parser.add_argument('--multistream', action='store_true',
-                        help='Use tri-stream RGB+frequency+SRM-like detector')
-    parser.add_argument('--freq-model', type=str, default='efficientnet-b2',
-                        help='EfficientNet variant for frequency stream')
-    parser.add_argument('--srm-model', type=str, default='efficientnet-b0',
-                        help='EfficientNet variant for SRM-like stream')
-    parser.add_argument('--srm-filters', type=int, default=30,
-                        help='Number of learnable SRM filters (noise channels)')
-    parser.add_argument('--amp', action='store_true',
-                        help='Enable mixed precision (recommended on GPU)')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from checkpoint')
+    # Data paths
+    parser.add_argument("--train-real", nargs="+", required=True)
+    parser.add_argument("--train-fake", nargs="+", required=True)
+    parser.add_argument("--val-real",   nargs="+", required=True)
+    parser.add_argument("--val-fake",   nargs="+", required=True)
+
+    # Output
+    parser.add_argument("--output-dir", type=str, default="outputs/temporal")
+
+    # Model
+    parser.add_argument("--model",       type=str, default="efficientnet-b4",
+                        help="EfficientNet backbone. B4 needs --grad-checkpoint + batch=2.")
+    parser.add_argument("--augmentation", type=str, default="medium",
+                        choices=["light", "medium", "heavy"],
+                        help="Augmentation level. 'medium' adds JPEG compression+blur "
+                             "for cross-dataset generalization.")
+    parser.add_argument("--bce",          action="store_true", default=True,
+                        help="Use FC(1)+BCEWithLogitsLoss (recommended for binary).")
+    parser.add_argument("--no-bce",       dest="bce", action="store_false",
+                        help="Use FC(2)+CrossEntropyLoss (legacy).")
+    parser.add_argument("--grad-checkpoint", action="store_true",
+                        help="Enable gradient checkpointing on backbone. "
+                             "Required for B4 fine-tuning on ≤16GB VRAM. "
+                             "Reduces activation memory ~6x, ~30%% slower.")
+    parser.add_argument("--n-frames",    type=int, default=16,
+                        help="Fixed T: number of frames per video sequence")
+    parser.add_argument("--sampling",    type=str, default="uniform",
+                        choices=["uniform", "random"],
+                        help="Frame selection strategy (uniform or random for training aug)")
+    parser.add_argument("--num-heads",   type=int, default=8,
+                        help="Temporal Transformer attention heads")
+    parser.add_argument("--num-layers",  type=int, default=2,
+                        help="Temporal Transformer encoder layers")
+    parser.add_argument("--srm-filters", type=int, default=30)
+
+    # Training
+    parser.add_argument("--batch-size",  type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--lr",          type=float, default=3e-4)
+    parser.add_argument("--amp",         action="store_true",
+                        help="Mixed precision (recommended on GPU)")
+
+    # 2-Phase training (new recommended strategy)
+    # Phase 1: freeze Transformer, train spatial encoder (mean-pool forward)
+    # Phase 2: unfreeze all, full temporal Transformer forward
+    parser.add_argument("--phase1-epochs", type=int, default=8,
+                        help="Phase 1: spatial-only training (Transformer frozen). "
+                             "Forward uses mean-pool — clean gradients to spatial encoder.")
+    parser.add_argument("--phase2-epochs", type=int, default=25,
+                        help="Phase 2: full temporal training (all params active). "
+                             "Transformer learns on stable spatial features.")
+    parser.add_argument("--lr-backbone",   type=float, default=5e-5,
+                        help="LR for spatial backbone in Phase 2 (lower than temporal head).")
+
+    # Class imbalance
+    parser.add_argument("--balanced-sampler",  action="store_true")
+    parser.add_argument("--focal-loss",        action="store_true")
+    parser.add_argument("--focal-gamma",       type=float, default=2.0)
+
+    # Evaluation
+    parser.add_argument("--best-metric",  type=str, default="auc",
+                        choices=["acc", "auc", "f1"])
+    parser.add_argument("--f1-threshold", type=float, default=0.5)
+
+    # Resuming / transfer
+    parser.add_argument("--resume",              type=str, default=None,
+                        help="Resume full temporal checkpoint")
+    parser.add_argument("--pretrained-spatial",  type=str, default=None,
+                        help="Bootstrap from a frame-level TriStream checkpoint")
 
     args = parser.parse_args()
 
-    # Create output directories
-    checkpoint_dir = Path(args.output_dir) / 'checkpoints'
-    log_dir = Path(args.output_dir) / 'logs'
-    results_dir = Path(args.output_dir) / 'results'
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # ── Directories ───────────────────────────────────────────────────────────
+    ckpt_dir    = Path(args.output_dir) / "checkpoints"
+    log_dir     = Path(args.output_dir) / "logs"
+    results_dir = Path(args.output_dir) / "results"
+    for d in [ckpt_dir, log_dir, results_dir]:
+        d.mkdir(parents=True, exist_ok=True)
 
-    # Setup logger
     logger = setup_logger(
-        name='training',
-        log_file=str(log_dir / 'training.log'),
-        level='INFO'
+        name="temporal_training",
+        log_file=str(log_dir / "training.log"),
+        level="INFO",
     )
 
-    logger.info("="*60)
-    logger.info("DeepFake Detection Training")
-    logger.info("="*60)
+    logger.info("=" * 60)
+    logger.info("Temporal DeepFake Detection Training")
+    logger.info("=" * 60)
+    logger.info(
+        f"2-Phase strategy:\n"
+        f"  Phase 1 ({args.phase1_epochs} epochs): spatial-only, Transformer FROZEN, mean-pool forward\n"
+        f"  Phase 2 ({args.phase2_epochs} epochs): full temporal, all params active"
+    )
 
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
 
-    # Create datasets
-    logger.info("Creating datasets...")
-
+    # ── Transforms ────────────────────────────────────────────────────────────
     image_size = _effnet_input_size(args.model)
+    train_tfm  = get_train_transforms(image_size, augmentation_level=args.augmentation)
+    val_tfm    = get_val_transforms(image_size)
+    logger.info(f"Augmentation level : {args.augmentation}")
 
-    train_transforms = get_train_transforms(image_size)
-    val_transforms = get_val_transforms(image_size)
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    logger.info(f"Loading video sequences (T={args.n_frames} frames)…")
 
-    # Prepare data configs
-    train_real_config = [(path, -1) for path in args.train_real]
-    train_fake_config = [(path, -1) for path in args.train_fake]
-    val_real_config = [(path, -1) for path in args.val_real]
-    val_fake_config = [(path, -1) for path in args.val_fake]
+    train_real_cfg = [(p, -1) for p in args.train_real]
+    train_fake_cfg = [(p, -1) for p in args.train_fake]
+    val_real_cfg   = [(p, -1) for p in args.val_real]
+    val_fake_cfg   = [(p, -1) for p in args.val_fake]
 
-    train_dataset = create_combined_dataset(train_real_config, train_fake_config, train_transforms)
-    val_dataset = create_combined_dataset(val_real_config, val_fake_config, val_transforms)
-
-    logger.info(f"Train dataset: {len(train_dataset)} samples")
-    logger.info(f"Val dataset: {len(val_dataset)} samples")
-
-    # Create dataloaders
-    if args.multistream:
-        # Tri-stream is GPU-memory heavy; keep the default batch small.
-        args.batch_size = min(args.batch_size, 2)
-
-    train_loader, val_loader, _ = create_dataloaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers
+    train_ds = CombinedVideoDataset(
+        VideoSequenceDataset(train_real_cfg, is_real=True,  transform=train_tfm,
+                             n_frames=args.n_frames, sampling=args.sampling),
+        VideoSequenceDataset(train_fake_cfg, is_real=False, transform=train_tfm,
+                             n_frames=args.n_frames, sampling=args.sampling),
+    )
+    val_ds = CombinedVideoDataset(
+        VideoSequenceDataset(val_real_cfg, is_real=True,  transform=val_tfm,
+                             n_frames=args.n_frames, sampling="uniform"),
+        VideoSequenceDataset(val_fake_cfg, is_real=False, transform=val_tfm,
+                             n_frames=args.n_frames, sampling="uniform"),
     )
 
-    # Create model
-    logger.info(f"Creating model: {args.model} (multistream={args.multistream})")
-    if args.multistream:
-        model = TriStreamDeepFakeDetector(
-            rgb_model=args.model,
-            freq_model=args.freq_model,
-            srm_model=args.srm_model,
-            srm_filters=args.srm_filters,
-            pretrained=True,
+    logger.info(f"Train: {len(train_ds)} videos  |  Val: {len(val_ds)} videos")
+
+    # ── Samplers ──────────────────────────────────────────────────────────────
+    train_sampler = None
+    if args.balanced_sampler:
+        labels_np = np.asarray(train_ds.labels, dtype=np.int64)
+        counts    = np.bincount(labels_np, minlength=2).astype(np.float64)
+        counts[counts == 0] = 1.0
+        weights   = (1.0 / counts)[labels_np]
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(weights, dtype=torch.double),
+            num_samples=len(weights),
+            replacement=True,
         )
-    else:
-        model = DeepFakeDetector(model_name=args.model, pretrained=True)
-    model = model.to(device)
+        logger.info(
+            f"WeightedRandomSampler: fake={int(counts[0])}, real={int(counts[1])} videos"
+        )
 
-    total_params, trainable_params = model.count_parameters()
-    logger.info(f"Total parameters: {total_params:,}")
-    logger.info(f"Trainable parameters: {trainable_params:,}")
-
-    # Loss, optimizer, scheduler
-    criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
-
-    num_train_steps = len(train_loader) * args.epochs
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=len(train_loader) * 5,
-        num_training_steps=num_train_steps
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
-    # Resume from checkpoint
+    # ── Model ─────────────────────────────────────────────────────────────────
+    bce_output = args.bce
+    logger.info(
+        f"Creating TemporalTriStreamDetector\n"
+        f"  Backbone       : {args.model}\n"
+        f"  Frames/vid     : {args.n_frames}  (fixed T)\n"
+        f"  Transformer    : {args.num_layers} layers × {args.num_heads} heads\n"
+        f"  Feat dim       : {_effnet_feat_dim(args.model)}-d\n"
+        f"  Output         : {'FC(1) + BCEWithLogitsLoss' if bce_output else 'FC(2) + CrossEntropyLoss'}\n"
+        f"  Grad checkpoint: {args.grad_checkpoint}"
+    )
+
+    model = TemporalTriStreamDetector(
+        backbone=args.model,
+        n_frames=args.n_frames,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        srm_filters=args.srm_filters,
+        pretrained=True,
+        bce_output=bce_output,
+        use_grad_checkpoint=args.grad_checkpoint,
+    ).to(device)
+
+    if args.pretrained_spatial:
+        logger.info(f"Loading spatial weights from: {args.pretrained_spatial}")
+        model.load_spatial_weights(args.pretrained_spatial, device=str(device))
+
+    # Start in Phase 1: Transformer frozen, spatial trains first
+    if args.phase1_epochs > 0:
+        model.set_phase(1)
+        current_phase = 1
+        logger.info("[Phase 1 START] Transformer FROZEN. Forward: mean-pool of frame features.")
+    else:
+        model.set_phase(2)
+        current_phase = 2
+        logger.info("[Phase 2 START] Full temporal training from epoch 1.")
+
+    total, trainable = model.count_parameters()
+    logger.info(f"Total parameters     : {total:,}")
+    logger.info(f"Trainable parameters : {trainable:,}")
+
+    # ── Loss ──────────────────────────────────────────────────────────────────
+    # Compute pos_weight = neg_count / pos_count for imbalanced dataset
+    labels_np = np.asarray(train_ds.labels, dtype=np.int64)
+    counts    = np.bincount(labels_np, minlength=2).astype(np.float64)
+    pos_weight_val = counts[0] / max(counts[1], 1.0)   # fake / real ratio
+    pos_weight_tensor = torch.tensor([pos_weight_val], dtype=torch.float32).to(device)
+    logger.info(f"pos_weight (neg/pos ratio): {pos_weight_val:.2f}")
+
+    if bce_output:
+        if args.focal_loss:
+            criterion = FocalBCELoss(
+                gamma=args.focal_gamma,
+                pos_weight=pos_weight_tensor,
+            )
+            logger.info(f"Loss: FocalBCELoss(gamma={args.focal_gamma}, pos_weight={pos_weight_val:.2f})")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+            logger.info(f"Loss: BCEWithLogitsLoss(pos_weight={pos_weight_val:.2f})")
+    else:
+        # Legacy FC(2) path
+        if args.focal_loss:
+            criterion = FocalLoss(gamma=args.focal_gamma)
+            logger.info(f"Loss: FocalLoss(gamma={args.focal_gamma})")
+        else:
+            criterion = nn.CrossEntropyLoss()
+            logger.info("Loss: CrossEntropyLoss")
+
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    # Phase 1: only spatial params are trainable
+    # Phase 2: all params with differential LR (backbone lower than temporal head)
+    spatial_params  = list(model.spatial.parameters())
+    temporal_params = list(model.temporal.parameters()) + list(model.classifier.parameters())
+
+    total_epochs = args.phase1_epochs + args.phase2_epochs
+    # Phase 1 optimizer: spatial only, full LR
+    optimizer = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=1e-3,
+    )
+    num_steps_p1 = len(train_loader) * max(args.phase1_epochs, 1)
+    warmup_p1    = len(train_loader) * min(3, max(args.phase1_epochs // 3, 1))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_p1, num_training_steps=num_steps_p1
+    )
+
+    # ── AMP scaler ────────────────────────────────────────────────────────────
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
+    best_score  = 0.0
+
     if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
+        logger.info(f"Resuming from: {args.resume}")
         ckpt = model.load_checkpoint(args.resume, device=str(device))
         if isinstance(ckpt, dict):
-            if 'optimizer_state_dict' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                logger.info("Loaded optimizer state from checkpoint")
-            if 'scheduler_state_dict' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-                logger.info("Loaded scheduler state from checkpoint")
-            if 'epoch' in ckpt:
-                start_epoch = int(ckpt['epoch'])
-                logger.info(f"Resuming from epoch {start_epoch + 1}")
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scheduler_state_dict" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if "epoch" in ckpt:
+                start_epoch = int(ckpt["epoch"])
 
-    # Training history
-    history = {
-        'train_loss': [],
-        'train_accuracy': [],
-        'val_loss': [],
-        'val_accuracy': []
-    }
+    # ── Training loop ─────────────────────────────────────────────────────────
+    history = {"train_loss": [], "train_accuracy": [], "val_loss": [], "val_accuracy": []}
 
-    # Training loop
-    best_val_acc = 0.0
+    for epoch in range(start_epoch + 1, total_epochs + 1):
+        logger.info(f"\nEpoch {epoch}/{total_epochs}")
 
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
+        # ── Phase transition: Phase 1 → Phase 2 ───────────────────────────────
+        if current_phase == 1 and epoch > args.phase1_epochs:
+            model.set_phase(2)
+            current_phase = 2
 
-    for epoch in range(start_epoch + 1, args.epochs + 1):
-        logger.info(f"\nEpoch {epoch}/{args.epochs}")
+            # Rebuild optimizer with differential LR:
+            #   backbone: small LR (features already good from Phase 1)
+            #   temporal head: full LR (learning from scratch)
+            optimizer = AdamW([
+                {"params": spatial_params,  "lr": args.lr_backbone},
+                {"params": temporal_params, "lr": args.lr},
+            ], weight_decay=1e-3)
+            num_steps_p2 = len(train_loader) * args.phase2_epochs
+            warmup_p2    = len(train_loader) * min(3, max(args.phase2_epochs // 6, 1))
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_p2, num_training_steps=num_steps_p2
+            )
+            # Reset AMP scaler for new phase
+            scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+            trainable_now = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(
+                f"[Phase 2 START] Epoch {epoch}: ALL params unfrozen.\n"
+                f"  Spatial LR   : {args.lr_backbone}\n"
+                f"  Temporal LR  : {args.lr}\n"
+                f"  Trainable    : {trainable_now:,} params\n"
+                f"  Forward mode : full Temporal Transformer"
+            )
 
         # Train
-        # Train with optional AMP
-        model.train()
-        running_loss = 0.0
-        all_preds = []
-        all_labels = []
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch} [Train]')
-
-        for images, labels in pbar:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-
-            running_loss += loss.item() * images.size(0)
-            preds = torch.argmax(outputs, dim=1).detach().cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.detach().cpu().numpy())
-
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        train_loss = running_loss / len(train_loader.dataset)
-        train_acc = accuracy_score(all_labels, all_preds)
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, scheduler,
+            scaler, device, epoch, bce_output
+        )
 
         # Validate
-        model.eval()
-        running_loss = 0.0
-        all_preds = []
-        all_labels = []
+        val_loss, val_acc, conf_mat, val_metrics, probs, labels_arr = validate_one_epoch(
+            model, val_loader, criterion, device, epoch, bce_output
+        )
 
-        pbar = tqdm(val_loader, desc=f'Epoch {epoch} [Val]')
-        with torch.no_grad():
-            for images, labels in pbar:
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+        val_auc     = float(val_metrics.get("auc_roc", 0.0))
+        opt_thr     = float(val_metrics.get("optimal_threshold", args.f1_threshold))
+        val_f1      = float(f1_score(labels_arr, (probs >= args.f1_threshold).astype(np.int64),
+                                      zero_division=0))
+        val_f1_opt  = float(f1_score(labels_arr, (probs >= opt_thr).astype(np.int64),
+                                      zero_division=0))
+        val_acc_opt = float(accuracy_score(labels_arr, (probs >= opt_thr).astype(np.int64)))
 
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+        logger.info(f"Train  loss={train_loss:.4f}  acc={train_acc:.4f}")
+        logger.info(
+            f"Val    loss={val_loss:.4f}  acc={val_acc:.4f}  "
+            f"AUC={val_auc:.4f}  F1={val_f1:.4f}  "
+            f"F1@opt({opt_thr:.3f})={val_f1_opt:.4f}  acc@opt={val_acc_opt:.4f}"
+        )
+        logger.info(f"Confusion matrix:\n{conf_mat}")
 
-                running_loss += loss.item() * images.size(0)
-                preds = torch.argmax(outputs, dim=1).detach().cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(labels.detach().cpu().numpy())
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        phase_tag = f"P{current_phase}"
+        history["train_loss"].append(train_loss)
+        history["train_accuracy"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_acc)
 
-        val_loss = running_loss / len(val_loader.dataset)
-        val_acc = accuracy_score(all_labels, all_preds)
-        conf_mat = confusion_matrix(all_labels, all_preds)
-
-        # Log metrics
-        logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-
-        # Update history
-        history['train_loss'].append(train_loss)
-        history['train_accuracy'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_accuracy'].append(val_acc)
-
-        # Save checkpoint
-        checkpoint_path = checkpoint_dir / f'epoch_{epoch}.pth'
+        # Save per-epoch checkpoint (tagged with phase)
+        ckpt_path = ckpt_dir / f"epoch_{epoch:03d}_{phase_tag}.pth"
         model.save_checkpoint(
-            str(checkpoint_path),
+            str(ckpt_path),
             epoch=epoch,
             optimizer_state=optimizer.state_dict(),
             scheduler_state=scheduler.state_dict(),
-            metrics={'val_acc': val_acc, 'val_loss': val_loss}
+            metrics={
+                "phase": current_phase,
+                "val_acc": val_acc, "val_loss": val_loss,
+                "val_auc": val_auc, "val_f1": val_f1,
+                "val_f1_opt": val_f1_opt, "val_acc_opt": val_acc_opt,
+                "val_optimal_threshold": opt_thr,
+            },
         )
 
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_path = checkpoint_dir / 'best_model.pth'
-            model.save_checkpoint(str(best_path), epoch=epoch)
-            logger.info(f"Best model saved with val_acc: {best_val_acc:.4f}")
+        # Save best model (only from Phase 2 — Phase 1 is spatial-only pre-training)
+        if current_phase == 2:
+            score = {"acc": val_acc, "auc": val_auc, "f1": val_f1}[args.best_metric]
+            if score > best_score:
+                best_score = score
+                best_path  = ckpt_dir / "best_model.pth"
+                model.save_checkpoint(str(best_path), epoch=epoch)
+                logger.info(f"Best model saved [{args.best_metric}={best_score:.4f}]")
+        else:
+            # In Phase 1, always save as spatial_pretrain.pth for possible bootstrap
+            spatial_path = ckpt_dir / "spatial_pretrain.pth"
+            model.save_checkpoint(str(spatial_path), epoch=epoch)
 
-    # Plot training history
-    logger.info("Plotting training history...")
+    # ── Plot ──────────────────────────────────────────────────────────────────
     plot_training_history(
         history,
-        metrics=['loss', 'accuracy'],
-        save_path=str(results_dir / 'training_history.png'),
-        show=False
+        metrics=["loss", "accuracy"],
+        save_path=str(results_dir / "training_history.png"),
+        show=False,
     )
 
     logger.info("Training complete!")
-    logger.info(f"Best validation accuracy: {best_val_acc:.4f}")
+    logger.info(f"Best {args.best_metric} (Phase 2): {best_score:.4f}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

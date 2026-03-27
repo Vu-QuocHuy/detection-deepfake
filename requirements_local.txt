@@ -1,0 +1,40 @@
+# Local training requirements
+# RTX 5060 Ti 16GB + i7-14700F
+# Install: pip install -r requirements_local.txt
+#
+# QUAN TRỌNG: Cài PyTorch trước với CUDA đúng version:
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+# Hoặc dùng lệnh mới nhất từ https://pytorch.org/get-started/locally/
+
+torch>=2.2.0
+torchvision>=0.17.0
+
+# EfficientNet backbone
+efficientnet-pytorch>=0.7.1
+
+# Face detection for extraction
+facenet-pytorch>=2.5.3
+
+# Augmentation
+albumentations==1.3.1
+
+# ML utilities
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Training scheduler
+transformers>=4.35.0
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Data & visualization
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+tqdm>=4.66.0
+
+# Notebook (optional)
+jupyter>=1.0.0
+ipywidgets>=8.0.0
