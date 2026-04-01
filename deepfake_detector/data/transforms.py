@@ -124,7 +124,7 @@ def get_train_transforms(
     ] + _norm)
 
 
-def get_val_transforms(image_size: int = 224) -> Compose:
+def get_val_transforms(image_size: int = 224) -> A.Compose:
     """
     Get validation/test data preprocessing pipeline.
 
@@ -138,9 +138,9 @@ def get_val_transforms(image_size: int = 224) -> Compose:
         >>> transforms = get_val_transforms(224)
         >>> preprocessed = transforms(image=image)
     """
-    return Compose([
-        Resize(image_size, image_size, always_apply=True),
-        Normalize(
+    return A.Compose([
+        A.Resize(image_size, image_size, always_apply=True),
+        A.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
             always_apply=True
@@ -168,10 +168,10 @@ def get_test_time_augmentation_transforms(image_size: int = 224) -> list:
         get_val_transforms(image_size),
 
         # Horizontal flip
-        Compose([
-            HorizontalFlip(p=1.0),
-            Resize(image_size, image_size, always_apply=True),
-            Normalize(
+        A.Compose([
+            A.HorizontalFlip(p=1.0),
+            A.Resize(image_size, image_size, always_apply=True),
+            A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
                 always_apply=True
@@ -180,10 +180,10 @@ def get_test_time_augmentation_transforms(image_size: int = 224) -> list:
         ]),
 
         # Slight brightness adjustment
-        Compose([
-            RandomBrightness(limit=0.1, p=1.0),
-            Resize(image_size, image_size, always_apply=True),
-            Normalize(
+        A.Compose([
+            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.0, p=1.0),
+            A.Resize(image_size, image_size, always_apply=True),
+            A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
                 always_apply=True
@@ -192,10 +192,10 @@ def get_test_time_augmentation_transforms(image_size: int = 224) -> list:
         ]),
 
         # Slight contrast adjustment
-        Compose([
-            RandomContrast(limit=0.1, p=1.0),
-            Resize(image_size, image_size, always_apply=True),
-            Normalize(
+        A.Compose([
+            A.RandomBrightnessContrast(brightness_limit=0.0, contrast_limit=0.1, p=1.0),
+            A.Resize(image_size, image_size, always_apply=True),
+            A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
                 always_apply=True

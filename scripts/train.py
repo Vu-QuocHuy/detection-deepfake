@@ -41,7 +41,9 @@ Usage example (local RTX 5060 Ti 16GB):
 """
 
 import argparse
+from contextlib import nullcontext
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -143,6 +145,40 @@ def _get_preds_probs(logits: torch.Tensor, bce_output: bool):
     return preds, probs
 
 
+def _make_grad_scaler(enabled: bool):
+    """Create a GradScaler compatible across torch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast_cuda(enabled: bool):
+    """Return an autocast context manager compatible across torch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=enabled)
+    if hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+        return torch.cuda.amp.autocast(enabled=enabled)
+    return nullcontext()
+
+
+def _infer_checkpoint_phase(ckpt: dict, ckpt_path: str, phase1_epochs: int) -> int:
+    """Infer saved training phase (1 or 2) from checkpoint metadata/path."""
+    metrics = ckpt.get("metrics", {}) if isinstance(ckpt, dict) else {}
+    phase = metrics.get("phase") if isinstance(metrics, dict) else None
+    if phase in (1, 2):
+        return int(phase)
+
+    epoch = ckpt.get("epoch") if isinstance(ckpt, dict) else None
+    if isinstance(epoch, int):
+        return 2 if epoch > phase1_epochs else 1
+
+    m = re.search(r"_P([12])(?:\.|$)", Path(ckpt_path).name)
+    if m:
+        return int(m.group(1))
+
+    return 1
+
+
 def train_one_epoch(model, loader, criterion, optimizer, scheduler,
                     scaler, device, epoch, bce_output: bool):
     model.train()
@@ -156,7 +192,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler,
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast('cuda', enabled=scaler.is_enabled()):
+        with _autocast_cuda(scaler.is_enabled()):
             logits = model(seqs)
             loss   = criterion(logits, labels)
 
@@ -291,6 +327,12 @@ def main():
 
     args = parser.parse_args()
 
+    # Windows: DataLoader multiprocessing uses torch shared memory; without this,
+    # collate can fail with "Couldn't open shared file mapping" / WinError 1455
+    # when RAM or page file is tight (often right after a phase change).
+    if sys.platform == "win32":
+        torch.multiprocessing.set_sharing_strategy("file_system")
+
     # ── Directories ───────────────────────────────────────────────────────────
     ckpt_dir    = Path(args.output_dir) / "checkpoints"
     log_dir     = Path(args.output_dir) / "logs"
@@ -303,6 +345,12 @@ def main():
         log_file=str(log_dir / "training.log"),
         level="INFO",
     )
+
+    if sys.platform == "win32":
+        logger.info(
+            "Windows: torch multiprocessing sharing strategy is file_system (DataLoader). "
+            "If collate still fails with shared file mapping / 1455, use --num-workers 0."
+        )
 
     logger.info("=" * 60)
     logger.info("Temporal DeepFake Detection Training")
@@ -454,20 +502,33 @@ def main():
     temporal_params = list(model.temporal.parameters()) + list(model.classifier.parameters())
 
     total_epochs = args.phase1_epochs + args.phase2_epochs
-    # Phase 1 optimizer: spatial only, full LR
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=1e-3,
-    )
-    num_steps_p1 = len(train_loader) * max(args.phase1_epochs, 1)
-    warmup_p1    = len(train_loader) * min(3, max(args.phase1_epochs // 3, 1))
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_p1, num_training_steps=num_steps_p1
-    )
+
+    def _build_optimizer_scheduler(phase: int):
+        if phase == 2:
+            opt = AdamW([
+                {"params": spatial_params,  "lr": args.lr_backbone},
+                {"params": temporal_params, "lr": args.lr},
+            ], weight_decay=1e-3)
+            num_steps = len(train_loader) * max(args.phase2_epochs, 1)
+            warmup = len(train_loader) * min(3, max(args.phase2_epochs // 6, 1))
+        else:
+            opt = AdamW(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=args.lr, weight_decay=1e-3,
+            )
+            num_steps = len(train_loader) * max(args.phase1_epochs, 1)
+            warmup = len(train_loader) * min(3, max(args.phase1_epochs // 3, 1))
+
+        sch = get_cosine_schedule_with_warmup(
+            opt, num_warmup_steps=warmup, num_training_steps=num_steps
+        )
+        return opt, sch
+
+    optimizer, scheduler = _build_optimizer_scheduler(current_phase)
 
     # ── AMP scaler ────────────────────────────────────────────────────────────
     use_amp = bool(args.amp and device.type == "cuda")
-    scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler  = _make_grad_scaler(use_amp)
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
@@ -477,10 +538,32 @@ def main():
         logger.info(f"Resuming from: {args.resume}")
         ckpt = model.load_checkpoint(args.resume, device=str(device))
         if isinstance(ckpt, dict):
+            resume_phase = _infer_checkpoint_phase(ckpt, args.resume, args.phase1_epochs)
+            if resume_phase != current_phase:
+                model.set_phase(resume_phase)
+                current_phase = resume_phase
+                optimizer, scheduler = _build_optimizer_scheduler(current_phase)
+                logger.info(
+                    f"Resume checkpoint indicates Phase {resume_phase}; "
+                    f"optimizer/scheduler rebuilt to match checkpoint phase."
+                )
+
             if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except ValueError as e:
+                    logger.warning(
+                        "Could not load optimizer state (likely parameter-group mismatch). "
+                        "Continuing with fresh optimizer state. Details: %s", e
+                    )
             if "scheduler_state_dict" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                except Exception as e:  # scheduler format can differ across runs
+                    logger.warning(
+                        "Could not load scheduler state. Continuing with fresh scheduler. "
+                        "Details: %s", e
+                    )
             if "epoch" in ckpt:
                 start_epoch = int(ckpt["epoch"])
 
@@ -517,7 +600,7 @@ def main():
                 optimizer, num_warmup_steps=warmup_p2, num_training_steps=num_steps_p2
             )
             # Reset AMP scaler for new phase
-            scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+            scaler = _make_grad_scaler(use_amp)
 
             trainable_now = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.info(

@@ -127,6 +127,12 @@ def main():
                              n_frames=n_frames, sampling="uniform"),
     )
     logger.info(f"Test set: {len(test_ds)} videos")
+    if len(test_ds) == 0:
+        logger.error(
+            "No test videos found. Fix --test-real / --test-fake paths "
+            "(relative paths are resolved from the current working directory)."
+        )
+        sys.exit(1)
 
     loader = DataLoader(
         test_ds,
