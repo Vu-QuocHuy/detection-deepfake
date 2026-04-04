@@ -191,7 +191,8 @@ def get_HTER_at_thr(probs: np.ndarray, labels: np.ndarray, thr: float) -> float:
 def calculate_comprehensive_metrics(
     probs: np.ndarray,
     labels: np.ndarray,
-    preds: Optional[np.ndarray] = None
+    preds: Optional[np.ndarray] = None,
+    fixed_decision_threshold: float = 0.5,
 ) -> Dict[str, float]:
     """
     Calculate all metrics including EER, ACER, accuracy, etc.
@@ -199,25 +200,25 @@ def calculate_comprehensive_metrics(
     Args:
         probs: Predicted probabilities for positive class
         labels: True labels
-        preds: Predicted class labels (optional, will be computed from probs if not provided)
+        preds: Ignored (legacy); use fixed_decision_threshold for the scored block.
+        fixed_decision_threshold: Threshold for ACC/Precision/F1/APCER and HTER.
+            On test, pass val optimal via scripts using --use-val-threshold.
 
     Returns:
         Dictionary with all metrics
     """
-    if preds is None:
-        preds = (probs >= 0.5).astype(int)
+    _ = preds
+    thr = float(fixed_decision_threshold)
 
-    # Standard metrics
-    metrics = calculate_metrics(probs, labels, threshold=0.5)
+    metrics = calculate_metrics(probs, labels, threshold=thr)
 
-    # EER and optimal threshold
     EER, optimal_thr, _, _ = get_EER_states(probs, labels)
     metrics['eer'] = EER
     metrics['optimal_threshold'] = optimal_thr
 
-    # HTER at threshold 0.5
-    HTER = get_HTER_at_thr(probs, labels, 0.5)
+    HTER = get_HTER_at_thr(probs, labels, thr)
     metrics['hter'] = HTER
+    metrics['fixed_decision_threshold_used'] = thr
 
     # Accuracy at optimal threshold
     optimal_preds = (probs >= optimal_thr).astype(int)

@@ -648,6 +648,21 @@ def main():
         )
         logger.info(f"Confusion matrix:\n{conf_mat}")
 
+        val_ckpt_metrics = {
+            "phase": current_phase,
+            "val_acc": val_acc,
+            "val_loss": val_loss,
+            "val_auc": val_auc,
+            "val_f1": val_f1,
+            "val_precision": val_prec,
+            "val_recall": val_rec,
+            "val_f1_opt": val_f1_opt,
+            "val_precision_opt": val_prec_opt,
+            "val_recall_opt": val_rec_opt,
+            "val_acc_opt": val_acc_opt,
+            "val_optimal_threshold": opt_thr,
+        }
+
         phase_tag = f"P{current_phase}"
         history["train_loss"].append(train_loss)
         history["train_accuracy"].append(train_acc)
@@ -665,16 +680,7 @@ def main():
             epoch=epoch,
             optimizer_state=optimizer.state_dict(),
             scheduler_state=scheduler.state_dict(),
-            metrics={
-                "phase": current_phase,
-                "val_acc": val_acc, "val_loss": val_loss,
-                "val_auc": val_auc, "val_f1": val_f1,
-                "val_precision": val_prec, "val_recall": val_rec,
-                "val_f1_opt": val_f1_opt,
-                "val_precision_opt": val_prec_opt, "val_recall_opt": val_rec_opt,
-                "val_acc_opt": val_acc_opt,
-                "val_optimal_threshold": opt_thr,
-            },
+            metrics=val_ckpt_metrics,
         )
 
         # Save best model (only from Phase 2 — Phase 1 is spatial-only pre-training)
@@ -682,13 +688,29 @@ def main():
             score = {"acc": val_acc, "auc": val_auc, "f1": val_f1}[args.best_metric]
             if score > best_score:
                 best_score = score
-                best_path  = ckpt_dir / "best_model.pth"
-                model.save_checkpoint(str(best_path), epoch=epoch)
-                logger.info(f"Best model saved [{args.best_metric}={best_score:.4f}]")
+                best_path = ckpt_dir / "best_model.pth"
+                best_ckpt_metrics = {
+                    **val_ckpt_metrics,
+                    "best_metric_name": args.best_metric,
+                    "best_metric_value": float(score),
+                }
+                model.save_checkpoint(
+                    str(best_path),
+                    epoch=epoch,
+                    metrics=best_ckpt_metrics,
+                )
+                logger.info(
+                    f"Best model saved [{args.best_metric}={best_score:.4f}] "
+                    f"val_optimal_threshold={opt_thr:.4f}"
+                )
         else:
             # In Phase 1, always save as spatial_pretrain.pth for possible bootstrap
             spatial_path = ckpt_dir / "spatial_pretrain.pth"
-            model.save_checkpoint(str(spatial_path), epoch=epoch)
+            model.save_checkpoint(
+                str(spatial_path),
+                epoch=epoch,
+                metrics=val_ckpt_metrics,
+            )
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_training_history(

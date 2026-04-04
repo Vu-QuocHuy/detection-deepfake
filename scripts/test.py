@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import confusion_matrix
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -85,7 +85,12 @@ def main():
     parser.add_argument("--batch-size",  type=int,  default=4)
     parser.add_argument("--num-workers", type=int,  default=4)
     parser.add_argument("--threshold",   type=float, default=0.5,
-                        help="Decision threshold for FAKE/REAL (applied to fake-prob)")
+                        help="Decision threshold on prob(real); used if not --use-val-threshold")
+    parser.add_argument(
+        "--use-val-threshold",
+        action="store_true",
+        help="Use metrics.val_optimal_threshold from checkpoint (validation EER-optimal).",
+    )
     parser.add_argument("--save-predictions", action="store_true")
 
     args = parser.parse_args()
@@ -113,6 +118,19 @@ def main():
     bce_output = ckpt.get("bce_output", True)
     logger.info(f"  backbone={backbone}  n_frames={n_frames}  bce_output={bce_output}")
 
+    thr_eff = float(args.threshold)
+    if args.use_val_threshold:
+        vm = ckpt.get("metrics") or {}
+        vo = vm.get("val_optimal_threshold")
+        if vo is not None:
+            thr_eff = float(vo)
+            logger.info(f"  decision_threshold={thr_eff:.4f} (from checkpoint val_optimal_threshold)")
+        else:
+            logger.warning(
+                "  --use-val-threshold but checkpoint has no metrics.val_optimal_threshold; "
+                f"using --threshold={args.threshold}"
+            )
+
     # ── Dataset ───────────────────────────────────────────────────────────────
     image_size = _effnet_input_size(backbone)
     tfm = get_val_transforms(image_size)
@@ -127,12 +145,6 @@ def main():
                              n_frames=n_frames, sampling="uniform"),
     )
     logger.info(f"Test set: {len(test_ds)} videos")
-    if len(test_ds) == 0:
-        logger.error(
-            "No test videos found. Fix --test-real / --test-fake paths "
-            "(relative paths are resolved from the current working directory)."
-        )
-        sys.exit(1)
 
     loader = DataLoader(
         test_ds,
@@ -167,10 +179,14 @@ def main():
     else:
         probs_real = probs
 
-    pred_labels = (probs_real >= args.threshold).astype(np.int64)
+    pred_labels = (probs_real >= thr_eff).astype(np.int64)
 
     # ── Metrics ───────────────────────────────────────────────────────────────
-    metrics = calculate_comprehensive_metrics(probs=probs_real, labels=labels)
+    metrics = calculate_comprehensive_metrics(
+        probs=probs_real,
+        labels=labels,
+        fixed_decision_threshold=thr_eff,
+    )
     print_metrics(metrics, title="Test Results")
 
     metrics_file = out_dir / "metrics.txt"
@@ -181,7 +197,8 @@ def main():
         f.write(f"backbone    : {backbone}\n")
         f.write(f"n_frames    : {n_frames}\n")
         f.write(f"test videos : {len(test_ds)}\n")
-        f.write(f"threshold   : {args.threshold}\n\n")
+        f.write(f"threshold_used : {thr_eff}\n")
+        f.write(f"use_val_threshold : {args.use_val_threshold}\n\n")
         for k, v in metrics.items():
             f.write(f"{k}: {v}\n")
     logger.info(f"Metrics saved to: {metrics_file}")
